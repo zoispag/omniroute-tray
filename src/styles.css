@@ -27,12 +27,17 @@ body {
   width: 320px;
   min-height: 100px;
   user-select: none;
-  background: var(--bg);
+  background: transparent;
 }
 
 #app {
   display: flex;
   flex-direction: column;
+  background: var(--bg);
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  margin: 6px;
 }
 
 .popover-header {
@@ -134,13 +139,73 @@ body {
 }
 
 .account {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   font-weight: 700;
-  font-size: 13px;
-  margin: 4px 0 8px;
+  font-size: 12px;
+  margin: 2px 0 5px;
 }
 
 .account:not(:first-child) {
-  margin-top: 14px;
+  margin-top: 10px;
+}
+
+.acct-toggle {
+  border: none;
+  background: none;
+  color: var(--text-faint);
+  font-size: 10.5px;
+  font-weight: 500;
+  cursor: pointer;
+  padding: 2px 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.acct-toggle:hover {
+  color: var(--text-muted);
+}
+
+.qrow {
+  display: grid;
+  grid-template-columns: 22px 1fr 34px 44px;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.qlabel {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.qbar {
+  height: 7px;
+  background: var(--track);
+  border-radius: 99px;
+  overflow: hidden;
+}
+
+.qfill {
+  display: block;
+  height: 100%;
+  border-radius: 99px;
+  transition: width 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.qpct {
+  font-size: 11px;
+  font-weight: 600;
+  text-align: right;
+}
+
+.qreset {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  text-align: right;
 }
 
 .row {
@@ -257,6 +322,61 @@ body {
 #update button:disabled {
   background: var(--text-faint);
   cursor: default;
+}
+
+.spark {
+  position: relative;
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 28px;
+  margin-top: 10px;
+}
+
+.spark-bar {
+  flex: 1;
+  min-width: 2px;
+  background: var(--accent);
+  border-radius: 1px;
+  opacity: 0.7;
+  transition: opacity 0.1s ease;
+}
+
+.spark-bar:hover {
+  opacity: 1;
+}
+
+.spark-tip {
+  position: absolute;
+  bottom: 34px;
+  transform: translateX(-50%);
+  background: var(--text);
+  color: var(--bg);
+  padding: 5px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 1.35;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 10;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+.spark-tip strong {
+  display: block;
+  font-weight: 600;
+}
+
+.app-version {
+  padding: 9px 16px;
+  border-top: 1px solid var(--border);
+  color: var(--text-faint);
+  font-size: 11px;
+  text-align: center;
+}
+
+.app-version:empty {
+  display: none;
 }
 
 .doctor-ok {

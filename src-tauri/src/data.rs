@@ -61,6 +61,7 @@ fn dedupe_quota(rows: Vec<QuotaRow>) -> Vec<QuotaRow> {
     seen.into_values().collect()
 }
 
+#[derive(Clone)]
 pub struct DataClient {
     node_bin: PathBuf,
     omniroute_entry: PathBuf,

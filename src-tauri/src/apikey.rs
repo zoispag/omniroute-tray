@@ -45,15 +45,18 @@ pub fn read_from_env_file(env_path: &Path) -> Option<String> {
     None
 }
 
+#[allow(dead_code)]
 fn keychain_entry() -> Result<keyring::Entry, ApiKeyError> {
     keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
         .map_err(|e| ApiKeyError::Keychain(e.to_string()))
 }
 
+#[allow(dead_code)]
 pub fn read_from_keychain() -> Option<String> {
     keychain_entry().ok()?.get_password().ok()
 }
 
+#[allow(dead_code)]
 pub fn store_in_keychain(key: &str) -> Result<(), ApiKeyError> {
     keychain_entry()?
         .set_password(key)
@@ -107,18 +110,7 @@ fn extract_key(raw: &str) -> Option<String> {
 }
 
 pub fn resolve(env_path: &Path, db_path: &Path) -> Option<String> {
-    if let Some(k) = read_from_keychain() {
-        return Some(k);
-    }
-    if let Some(k) = read_from_env_file(env_path) {
-        let _ = store_in_keychain(&k);
-        return Some(k);
-    }
-    if let Some(k) = read_from_db(db_path) {
-        let _ = store_in_keychain(&k);
-        return Some(k);
-    }
-    None
+    read_from_env_file(env_path).or_else(|| read_from_db(db_path))
 }
 
 #[cfg(test)]

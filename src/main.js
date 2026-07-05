@@ -20,7 +20,7 @@ async function refresh() {
     renderHeader(status);
     renderUpdate(status);
     if (status.state === "running" || status.state === "update-available") {
-      await Promise.all([renderRateLimits(), renderQuota(), renderCost()]);
+      await Promise.all([renderRateLimits(), renderCost(), renderTrend()]);
     } else {
       clearSections();
     }
@@ -67,6 +67,21 @@ function renderHeader(status) {
   }
 }
 
+let hiddenAccounts = new Set(
+  JSON.parse(localStorage.getItem("hiddenAccounts") || "[]")
+);
+
+function accountKey(acc) {
+  return `${acc.provider}/${acc.account}`;
+}
+
+function toggleHidden(key) {
+  if (hiddenAccounts.has(key)) hiddenAccounts.delete(key);
+  else hiddenAccounts.add(key);
+  localStorage.setItem("hiddenAccounts", JSON.stringify([...hiddenAccounts]));
+  renderRateLimits();
+}
+
 async function renderRateLimits() {
   const accounts = await invoke("get_rate_limits");
   const section = document.getElementById("ratelimits");
@@ -79,29 +94,34 @@ async function renderRateLimits() {
   }</button>`;
   const blocks = accounts
     .map((acc) => {
+      const key = accountKey(acc);
+      const hidden = hiddenAccounts.has(key);
+      const eye = hidden ? "show" : "hide";
+      const head = `<div class="account"><span>${acc.account}</span><button class="acct-toggle" data-key="${key}">${eye}</button></div>`;
+      if (hidden) return head;
       const windows = acc.windows
         .map((w) => {
           const used = w.used_percent;
           const left = 100 - used;
           const shown = showUsed ? used : left;
-          const lowLeft = left < 20;
-          const reset = w.reset_at ? formatReset(w.reset_at) : "";
-          const color = left > 40 ? "var(--good)" : left > 15 ? "var(--warn)" : "var(--bad)";
+          const fill = showUsed ? used : left;
+          const reset = w.reset_at ? formatResetShort(w.reset_at) : "";
+          const label = refineLabel(w.short, w.reset_at);
+          const color =
+            left > 40 ? "var(--good)" : left > 15 ? "var(--warn)" : "var(--bad)";
           return `
-            <div class="row">
-              <div class="row-head">
-                <span class="provider">${w.label}</span>
-                <span class="pct ${lowLeft ? "low" : ""}">${shown.toFixed(0)}% ${showUsed ? "used" : "left"}</span>
-              </div>
-              <div class="bar"><div class="bar-fill" style="width:${left}%;background:${color}"></div></div>
-              <div class="reset-line">${reset}</div>
+            <div class="qrow">
+              <span class="qlabel">${label}</span>
+              <span class="qbar"><span class="qfill" style="width:${fill}%;background:${color}"></span></span>
+              <span class="qpct" style="color:${color}">${shown.toFixed(0)}%</span>
+              <span class="qreset">${reset}</span>
             </div>`;
         })
         .join("");
-      return `<div class="account">${acc.account}</div>${windows}`;
+      return head + windows;
     })
     .join("");
-  section.innerHTML = `<div class="section-head"><h3>Claude</h3>${toggle}</div>${blocks}`;
+  section.innerHTML = `<div class="section-head"><h3>Usage</h3>${toggle}</div>${blocks}`;
   const btn = document.getElementById("mode-toggle");
   if (btn) {
     btn.onclick = () => {
@@ -110,40 +130,9 @@ async function renderRateLimits() {
       renderRateLimits();
     };
   }
-}
-
-async function renderQuota() {
-  const rows = await invoke("get_quota");
-  const section = document.getElementById("quota");
-  if (!rows.length) {
-    section.innerHTML = "";
-    return;
-  }
-  const items = rows
-    .map((r) => {
-      const pct = quotaPercent(r);
-      const reset = r.resetAt ? formatReset(r.resetAt) : "";
-      return `
-        <div class="row">
-          <div class="row-head">
-            <span class="provider">${r.provider}</span>
-            <span class="reset">${reset}</span>
-          </div>
-          <div class="bar"><div class="bar-fill" style="width:${pct}%"></div></div>
-        </div>`;
-    })
-    .join("");
-  section.innerHTML = `<h3>Providers</h3>${items}`;
-}
-
-function quotaPercent(row) {
-  if (row.limit && row.used != null) {
-    return Math.max(0, Math.min(100, (1 - row.used / row.limit) * 100));
-  }
-  if (row.remaining != null) {
-    return Math.max(0, Math.min(100, row.remaining));
-  }
-  return 100;
+  section.querySelectorAll(".acct-toggle").forEach((b) => {
+    b.onclick = () => toggleHidden(b.dataset.key);
+  });
 }
 
 function formatReset(value) {
@@ -164,6 +153,41 @@ function formatReset(value) {
   if (h > 0) return `reset in ${h}h ${m}m`;
   return `reset in ${m}m`;
 }
+
+function resetMinutes(value) {
+  let then;
+  if (/^\d+$/.test(String(value))) {
+    const n = Number(value);
+    then = n < 1e12 ? n * 1000 : n;
+  } else {
+    then = new Date(value).getTime();
+  }
+  const diff = then - Date.now();
+  if (Number.isNaN(then) || diff <= 0) return null;
+  return Math.floor(diff / 6e4);
+}
+
+function refineLabel(short, resetAt) {
+  if (short !== "sess" || !resetAt) return short;
+  const mins = resetMinutes(resetAt);
+  if (mins == null) return short;
+  const days = mins / 1440;
+  if (days >= 25) return "mo";
+  if (days >= 5) return "wk";
+  if (days >= 0.8) return "1d";
+  return short;
+}
+
+function formatResetShort(value) {
+  const totalMin = resetMinutes(value);
+  if (totalMin == null) return "";
+  const d = Math.floor(totalMin / 1440);
+  const h = Math.floor((totalMin % 1440) / 60);
+  const m = totalMin % 60;
+  return d > 0 ? `${d}d${h}h` : `${h}h${m}m`;
+}
+
+
 
 async function renderCost() {
   const result = await invoke("get_cost");
@@ -203,10 +227,68 @@ function formatTokens(n) {
   return `${n} tokens`;
 }
 
+function money(n) {
+  return `$${(n ?? 0).toFixed(2)}`;
+}
+
+function sparkline(days) {
+  if (!days.length) return "";
+  const max = Math.max(...days.map((d) => d.cost), 0.0001);
+  const bars = days
+    .map((d) => {
+      const h = Math.max(2, Math.round((d.cost / max) * 24));
+      return `<span class="spark-bar" style="height:${h}px" data-date="${d.date}" data-cost="${money(d.cost)}" data-tokens="${formatTokens(d.tokens)}"></span>`;
+    })
+    .join("");
+  return `<div class="spark">${bars}</div><div class="spark-tip" id="spark-tip" hidden></div>`;
+}
+
+function wireSparkline() {
+  const spark = document.querySelector(".spark");
+  const tip = document.getElementById("spark-tip");
+  if (!spark || !tip) return;
+  spark.querySelectorAll(".spark-bar").forEach((bar) => {
+    bar.onmouseenter = () => {
+      tip.innerHTML = `<strong>${bar.dataset.date}</strong>${bar.dataset.cost} · ${bar.dataset.tokens}`;
+      tip.hidden = false;
+      const sr = spark.getBoundingClientRect();
+      const br = bar.getBoundingClientRect();
+      tip.style.left = `${br.left - sr.left + br.width / 2}px`;
+    };
+    bar.onmouseleave = () => {
+      tip.hidden = true;
+    };
+  });
+}
+
+async function renderTrend() {
+  const t = await invoke("get_usage_trend");
+  const section = document.getElementById("trend");
+  if (!t || !t.days.length) {
+    section.innerHTML = "";
+    return;
+  }
+  section.innerHTML = `
+    <h3>Usage Trend</h3>
+    <div class="cost-row"><span>Today</span><span>${money(t.today_cost)} · ${formatTokens(t.today_tokens)}</span></div>
+    <div class="cost-row"><span>Yesterday</span><span>${money(t.yesterday_cost)} · ${formatTokens(t.yesterday_tokens)}</span></div>
+    <div class="cost-row"><span>Last 30 Days</span><span>${money(t.total_cost)} · ${formatTokens(t.total_tokens)}</span></div>
+    ${sparkline(t.days)}`;
+  wireSparkline();
+}
+
+async function renderVersion() {
+  const el = document.getElementById("app-version");
+  if (el.textContent) return;
+  try {
+    el.textContent = `OmniRouteTray ${await invoke("get_app_version")}`;
+  } catch {}
+}
+
 function clearSections() {
   document.getElementById("ratelimits").innerHTML = "";
-  document.getElementById("quota").innerHTML = "";
   document.getElementById("cost").innerHTML = "";
+  document.getElementById("trend").innerHTML = "";
 }
 
 async function runDoctor() {
@@ -226,10 +308,11 @@ async function runDoctor() {
 }
 
 async function fitWindow() {
-  const height = Math.min(600, document.getElementById("app").scrollHeight + 8);
+  const app = document.getElementById("app");
+  const height = Math.min(620, app.offsetHeight + 16);
   try {
     const { LogicalSize } = await import("@tauri-apps/api/dpi");
-    await getCurrentWindow().setSize(new LogicalSize(340, height));
+    await getCurrentWindow().setSize(new LogicalSize(332, height));
   } catch {}
 }
 
@@ -237,8 +320,13 @@ getCurrentWindow().listen("run-doctor", runDoctor);
 
 async function tick() {
   await refresh();
+  await renderVersion();
   await fitWindow();
 }
 
-tick();
-setInterval(tick, 5000);
+async function loop() {
+  await tick();
+  setTimeout(loop, 5000);
+}
+
+loop();

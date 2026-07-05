@@ -15,6 +15,7 @@ pub enum RateLimitError {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Window {
     pub label: String,
+    pub short: String,
     pub used_percent: f64,
     pub reset_at: Option<String>,
     pub unlimited: bool,
@@ -127,6 +128,7 @@ pub fn parse_usage(raw: &str) -> Result<Vec<Window>, RateLimitError> {
         let unlimited = q.get("unlimited").and_then(Value::as_bool).unwrap_or(false);
         windows.push(Window {
             label: pretty_label(key),
+            short: short_label(key),
             used_percent: used_percent_of(q),
             reset_at: q.get("resetAt").and_then(Value::as_str).map(str::to_string),
             unlimited,
@@ -149,6 +151,31 @@ fn used_percent_of(q: &Value) -> f64 {
         }
     }
     0.0
+}
+
+fn short_label(key: &str) -> String {
+    let k = key.to_lowercase();
+    if let Some(start) = k.find('(') {
+        if let Some(end) = k[start..].find(')') {
+            let inner = k[start + 1..start + end].trim();
+            if !inner.is_empty() {
+                return inner.to_string();
+            }
+        }
+    }
+    if k.contains("monthly") {
+        return "mo".to_string();
+    }
+    if k.contains("weekly") {
+        return "wk".to_string();
+    }
+    if k.contains("5h") {
+        return "5h".to_string();
+    }
+    if k.starts_with("session") {
+        return "sess".to_string();
+    }
+    k.chars().take(4).collect()
 }
 
 fn pretty_label(key: &str) -> String {
@@ -254,6 +281,22 @@ mod tests {
         assert_eq!(w.len(), 2);
         assert_eq!(w[0].label, "Session");
         assert_eq!(w[1].label, "Weekly");
+    }
+
+    #[test]
+    fn short_label_reflects_real_window() {
+        assert_eq!(short_label("session (5h)"), "5h");
+        assert_eq!(short_label("weekly (7d)"), "7d");
+        assert_eq!(short_label("session"), "sess");
+        assert_eq!(short_label("window_monthly"), "mo");
+        assert_eq!(short_label("window_weekly"), "wk");
+    }
+
+    #[test]
+    fn parses_short_from_usage() {
+        let w = parse_usage(USAGE).unwrap();
+        assert_eq!(w[0].short, "5h");
+        assert_eq!(w[1].short, "7d");
     }
 
     #[test]

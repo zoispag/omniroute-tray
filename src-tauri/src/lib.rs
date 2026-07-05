@@ -1,3 +1,4 @@
+mod analytics;
 mod apikey;
 mod data;
 mod doctor;
@@ -177,32 +178,62 @@ fn get_status(state: tauri::State<AppState>) -> ServerState {
 }
 
 #[tauri::command]
-fn get_quota(state: tauri::State<AppState>) -> Result<Vec<QuotaRow>, String> {
-    let guard = state.data.lock().unwrap();
-    match guard.as_ref() {
-        Some(client) => client.quota().map_err(|e| e.to_string()),
-        None => Ok(Vec::new()),
-    }
+fn get_app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
 }
 
 #[tauri::command]
-fn get_cost(state: tauri::State<AppState>) -> CostResult {
-    let guard = state.data.lock().unwrap();
-    match guard.as_ref() {
-        Some(client) => client.cost_by_model("30d"),
-        None => CostResult::unavailable(),
-    }
+async fn get_quota(state: tauri::State<'_, AppState>) -> Result<Vec<QuotaRow>, String> {
+    let client = state.data.lock().unwrap().clone();
+    let Some(client) = client else {
+        return Ok(Vec::new());
+    };
+    tauri::async_runtime::spawn_blocking(move || client.quota())
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn get_rate_limits(
-    state: tauri::State<AppState>,
+async fn get_cost(state: tauri::State<'_, AppState>) -> Result<CostResult, String> {
+    let client = state.data.lock().unwrap().clone();
+    let Some(client) = client else {
+        return Ok(CostResult::unavailable());
+    };
+    tauri::async_runtime::spawn_blocking(move || client.cost_by_model("30d"))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_rate_limits(
+    state: tauri::State<'_, AppState>,
 ) -> Result<Vec<ratelimits::AccountLimits>, String> {
     let key = state.api_key.lock().unwrap().clone();
-    match key {
-        Some(k) => ratelimits::fetch("http://127.0.0.1:20128", &k).map_err(|e| e.to_string()),
-        None => Ok(Vec::new()),
-    }
+    let Some(key) = key else {
+        return Ok(Vec::new());
+    };
+    tauri::async_runtime::spawn_blocking(move || ratelimits::fetch("http://127.0.0.1:20128", &key))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_usage_trend(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<analytics::UsageTrend>, String> {
+    let key = state.api_key.lock().unwrap().clone();
+    let Some(key) = key else {
+        return Ok(None);
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        analytics::fetch("http://127.0.0.1:20128", &key, "30d")
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map(Some)
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -415,6 +446,8 @@ pub fn run() {
             get_quota,
             get_cost,
             get_rate_limits,
+            get_usage_trend,
+            get_app_version,
             set_autostart,
             run_doctor,
             get_log_path,
