@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Fetch bundled Node runtime
+        run: bash scripts/fetch-node.sh
+        env:
+          NODE_VERSION: v26.4.0
+
+      - name: Build app
+        run: npm run tauri build -- --bundles app,dmg
+
+      - name: Sign (Developer ID if configured, else ad-hoc)
+        env:
+          SIGN_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          APP="src-tauri/target/release/bundle/macos/OmniRouteTray.app"
+          ENT="src-tauri/entitlements.plist"
+          IDENTITY="${SIGN_IDENTITY:--}"
+          codesign --force --options runtime --entitlements "$ENT" \
+            --sign "$IDENTITY" "$APP/Contents/Resources/node/bin/node"
+          codesign --force --deep --options runtime --entitlements "$ENT" \
+            --sign "$IDENTITY" "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+      - name: Notarize and staple (only with Apple credentials)
+        if: ${{ secrets.APPLE_ID != '' }}
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          DMG=$(find src-tauri/target/release/bundle/dmg -name "*.dmg" | head -1)
+          xcrun notarytool submit "$DMG" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          xcrun stapler staple "$DMG"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: OmniRouteTray-macos
+          path: |
+            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/macos/*.app
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: src-tauri/target/release/bundle/dmg/*.dmg
