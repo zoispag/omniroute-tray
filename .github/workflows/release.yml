@@ -9,6 +9,11 @@ on:
 jobs:
   build-macos:
     runs-on: macos-14
+    env:
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
     steps:
       - uses: actions/checkout@v4
 
@@ -41,12 +46,10 @@ jobs:
         run: npm run tauri build -- --bundles app,dmg
 
       - name: Sign (Developer ID if configured, else ad-hoc)
-        env:
-          SIGN_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
           APP="src-tauri/target/release/bundle/macos/OmniRouteTray.app"
           ENT="src-tauri/entitlements.plist"
-          IDENTITY="${SIGN_IDENTITY:--}"
+          IDENTITY="${APPLE_SIGNING_IDENTITY:--}"
           codesign --force --options runtime --entitlements "$ENT" \
             --sign "$IDENTITY" "$APP/Contents/Resources/node/bin/node"
           codesign --force --deep --options runtime --entitlements "$ENT" \
@@ -54,16 +57,12 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$APP"
 
       - name: Notarize and staple (only with Apple credentials)
-        if: ${{ secrets.APPLE_ID != '' }}
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        if: env.APPLE_ID != ''
         run: |
           DMG=$(find src-tauri/target/release/bundle/dmg -name "*.dmg" | head -1)
           xcrun notarytool submit "$DMG" \
             --apple-id "$APPLE_ID" \
-            --password "$APPLE_PASSWORD" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
             --wait
           xcrun stapler staple "$DMG"
