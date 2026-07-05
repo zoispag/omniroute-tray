@@ -42,18 +42,14 @@ jobs:
         env:
           NODE_VERSION: v26.4.0
 
-      - name: Build app
+      - name: Build app (Developer ID if configured, else ad-hoc)
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY || '-' }}
         run: npm run tauri build -- --bundles app,dmg
 
-      - name: Sign (Developer ID if configured, else ad-hoc)
+      - name: Verify signature
         run: |
           APP="src-tauri/target/release/bundle/macos/OmniRouteTray.app"
-          ENT="src-tauri/entitlements.plist"
-          IDENTITY="${APPLE_SIGNING_IDENTITY:--}"
-          codesign --force --options runtime --entitlements "$ENT" \
-            --sign "$IDENTITY" "$APP/Contents/Resources/node/bin/node"
-          codesign --force --deep --options runtime --entitlements "$ENT" \
-            --sign "$IDENTITY" "$APP"
           codesign --verify --deep --strict --verbose=2 "$APP"
 
       - name: Notarize and staple (only with Apple credentials)
