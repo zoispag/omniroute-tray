@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { PROVIDER_ICONS } from "./icons.js";
 
 const STATE_LABELS = {
   stopped: "Stopped",
@@ -75,29 +76,43 @@ function accountKey(acc) {
   return `${acc.provider}/${acc.account}`;
 }
 
+let rateLimitCache = [];
+
+function providerBadge(provider) {
+  const icon = PROVIDER_ICONS[provider];
+  if (icon) {
+    return `<span class="prov-badge" title="${provider}">${icon}</span>`;
+  }
+  return `<span class="prov-badge prov-fallback" title="${provider}">●</span>`;
+}
+
 function toggleHidden(key) {
   if (hiddenAccounts.has(key)) hiddenAccounts.delete(key);
   else hiddenAccounts.add(key);
   localStorage.setItem("hiddenAccounts", JSON.stringify([...hiddenAccounts]));
-  renderRateLimits();
+  paintRateLimits();
 }
 
 async function renderRateLimits() {
-  const accounts = await invoke("get_rate_limits");
+  rateLimitCache = await invoke("get_rate_limits");
+  paintRateLimits();
+}
+
+function paintRateLimits() {
   const section = document.getElementById("ratelimits");
-  if (!accounts.length) {
+  if (!rateLimitCache.length) {
     section.innerHTML = "";
     return;
   }
   const toggle = `<button id="mode-toggle" class="mode-toggle">${
     showUsed ? "% used" : "% left"
   }</button>`;
-  const blocks = accounts
+  const blocks = rateLimitCache
     .map((acc) => {
       const key = accountKey(acc);
       const hidden = hiddenAccounts.has(key);
       const eye = hidden ? "show" : "hide";
-      const head = `<div class="account"><span>${acc.account}</span><button class="acct-toggle" data-key="${key}">${eye}</button></div>`;
+      const head = `<div class="account">${providerBadge(acc.provider)}<span class="acct-name">${acc.account}</span><button class="acct-toggle" data-key="${key}">${eye}</button></div>`;
       if (hidden) return head;
       const windows = acc.windows
         .map((w) => {
@@ -127,7 +142,7 @@ async function renderRateLimits() {
     btn.onclick = () => {
       showUsed = !showUsed;
       localStorage.setItem("quotaMode", showUsed ? "used" : "left");
-      renderRateLimits();
+      paintRateLimits();
     };
   }
   section.querySelectorAll(".acct-toggle").forEach((b) => {
