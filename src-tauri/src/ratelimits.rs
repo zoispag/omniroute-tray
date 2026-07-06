@@ -61,6 +61,7 @@ pub fn fetch(base_url: &str, api_key: &str) -> Result<Vec<AccountLimits>, RateLi
 fn get(base_url: &str, path: &str, api_key: &str) -> Result<String, RateLimitError> {
     let url = format!("{base_url}{path}");
     match ureq::get(&url)
+        .timeout(std::time::Duration::from_secs(4))
         .set("Authorization", &format!("Bearer {api_key}"))
         .call()
     {
@@ -229,10 +230,11 @@ fn reset_bucket_label(_reset: &str) -> String {
 fn reset_bucket_short(reset: &str) -> String {
     let mins = minutes_until(reset);
     match mins {
-        Some(m) if m >= 25 * 1440 => "mo".to_string(),
-        Some(m) if m >= 5 * 1440 => "wk".to_string(),
-        Some(m) if m >= 1440 => "1d".to_string(),
-        Some(_) => "5h".to_string(),
+        Some(m) if m >= 20 * 1440 => "mo".to_string(),
+        Some(m) if m >= 4 * 1440 => "wk".to_string(),
+        Some(m) if m >= 20 * 60 => "1d".to_string(),
+        Some(m) if m >= 3 * 60 => "5h".to_string(),
+        Some(_) => "1h".to_string(),
         None => "win".to_string(),
     }
 }
