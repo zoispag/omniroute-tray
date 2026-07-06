@@ -207,15 +207,33 @@ pub fn ensure_installed(
     pinned: &str,
 ) -> Result<String, InstallError> {
     prefix.discard_incomplete()?;
+
     if let Some(active) = prefix.active_version() {
-        return Ok(active);
+        if verify_install(prefix, &active).is_ok() {
+            return Ok(active);
+        }
+        prefix.deactivate()?;
+        prefix.discard_version(&active)?;
     }
-    if let Ok(good) = prefix.last_good_version() {
+
+    if let Some(good) = verified_last_good(prefix)? {
         prefix.activate(&good)?;
         return Ok(good);
     }
+
+    prefix.discard_version(pinned)?;
     install_version(prefix, node, pinned)?;
     Ok(pinned.to_string())
+}
+
+fn verified_last_good(prefix: &Prefix) -> Result<Option<String>, InstallError> {
+    for version in prefix.complete_versions_desc()? {
+        if verify_install(prefix, &version).is_ok() {
+            return Ok(Some(version));
+        }
+        prefix.discard_version(&version)?;
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -260,6 +278,17 @@ mod tests {
         write_pkg(&prefix, "3.8.44", "3.8.45");
         let err = verify_install(&prefix, "3.8.44").unwrap_err();
         assert!(matches!(err, InstallError::Incomplete(_)));
+    }
+
+    #[test]
+    fn verified_last_good_prunes_broken_marked_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prefix = Prefix::new(tmp.path());
+        prefix.ensure_layout().unwrap();
+        std::fs::create_dir_all(prefix.version_dir("3.8.44")).unwrap();
+        prefix.mark_complete("3.8.44").unwrap();
+        assert!(verified_last_good(&prefix).unwrap().is_none());
+        assert!(!prefix.version_dir("3.8.44").is_dir());
     }
 
     #[test]
