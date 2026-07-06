@@ -172,9 +172,30 @@ fn download_and_verify(
 ) -> Result<(), InstallError> {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir)?;
+    isolate_install_root(dir)?;
     node.npm_install(&format!("omniroute@{version}"), dir)?;
     verify_install(prefix, version)?;
     prefix.mark_complete(version)?;
+    Ok(())
+}
+
+/// Write a minimal `package.json` so `npm install` treats `dir` as the project
+/// root instead of walking up the directory tree.
+///
+/// `npm install <spec>` searches ancestor directories for the nearest
+/// `package.json` to decide where to install. The version dir lives deep under
+/// the user's home (`~/Library/Application Support/.../versions/<v>`), so if any
+/// ancestor — most commonly `~/package.json` left behind by a stray
+/// `npm install omniroute` run from `$HOME` — contains a manifest, npm installs
+/// into *that* directory's `node_modules` and reports "up to date", leaving the
+/// prefix empty. The install then "succeeds" while `verify_install` fails and
+/// the version is rolled back, so first run never completes. A manifest in `dir`
+/// pins the install root and makes it immune to ancestor manifests.
+fn isolate_install_root(dir: &Path) -> Result<(), InstallError> {
+    std::fs::write(
+        dir.join("package.json"),
+        b"{\n  \"name\": \"omniroute-prefix\",\n  \"private\": true\n}\n",
+    )?;
     Ok(())
 }
 
@@ -261,6 +282,16 @@ mod tests {
         let prefix = Prefix::new(tmp.path());
         write_pkg(&prefix, "3.8.44", "3.8.44");
         assert!(verify_install(&prefix, "3.8.44").is_ok());
+    }
+
+    #[test]
+    fn isolate_install_root_writes_manifest_pinning_the_install_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        isolate_install_root(tmp.path()).unwrap();
+        let pkg = tmp.path().join("package.json");
+        assert!(pkg.is_file(), "package.json must exist to pin the npm root");
+        let raw = std::fs::read_to_string(&pkg).unwrap();
+        assert!(raw.contains("\"private\": true"));
     }
 
     #[test]
