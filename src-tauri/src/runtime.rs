@@ -11,8 +11,6 @@ const VERSIONS_DIR: &str = "versions";
 pub enum RuntimeError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("no installed omniroute version found")]
-    NoVersionInstalled,
     #[error("version {0} is not installed or incomplete")]
     VersionUnavailable(String),
 }
@@ -96,6 +94,40 @@ impl Prefix {
         }
     }
 
+    pub fn deactivate(&self) -> Result<(), RuntimeError> {
+        let link = self.current_link();
+        match fs::remove_file(&link) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn discard_version(&self, version: &str) -> Result<(), RuntimeError> {
+        let dir = self.version_dir(version);
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn complete_versions_desc(&self) -> Result<Vec<String>, RuntimeError> {
+        let versions = self.versions_dir();
+        let mut candidates: Vec<String> = Vec::new();
+        if versions.is_dir() {
+            for entry in fs::read_dir(&versions)? {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().to_string();
+                if self.is_version_complete(&name) {
+                    candidates.push(name);
+                }
+            }
+        }
+        candidates.sort_by(|a, b| compare_versions(b, a));
+        Ok(candidates)
+    }
+
     pub fn discard_incomplete(&self) -> Result<Vec<String>, RuntimeError> {
         let mut discarded = Vec::new();
         let versions = self.versions_dir();
@@ -114,22 +146,6 @@ impl Prefix {
             }
         }
         Ok(discarded)
-    }
-
-    pub fn last_good_version(&self) -> Result<String, RuntimeError> {
-        let versions = self.versions_dir();
-        let mut candidates: Vec<String> = Vec::new();
-        if versions.is_dir() {
-            for entry in fs::read_dir(&versions)? {
-                let entry = entry?;
-                let name = entry.file_name().to_string_lossy().to_string();
-                if self.is_version_complete(&name) {
-                    candidates.push(name);
-                }
-            }
-        }
-        candidates.sort_by(|a, b| compare_versions(a, b));
-        candidates.pop().ok_or(RuntimeError::NoVersionInstalled)
     }
 
     #[allow(dead_code)]
@@ -225,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn last_good_returns_highest_semver() {
+    fn complete_versions_desc_orders_highest_first() {
         let tmp = tempfile::tempdir().unwrap();
         let prefix = Prefix::new(tmp.path());
         prefix.ensure_layout().unwrap();
@@ -233,7 +249,14 @@ mod tests {
             write_dummy_install(&prefix, v);
             prefix.mark_complete(v).unwrap();
         }
-        assert_eq!(prefix.last_good_version().unwrap(), "3.9.0");
+        assert_eq!(
+            prefix
+                .complete_versions_desc()
+                .unwrap()
+                .first()
+                .map(String::as_str),
+            Some("3.9.0")
+        );
     }
 
     #[test]
@@ -257,7 +280,12 @@ mod tests {
         prefix.activate("3.8.44").unwrap();
         write_dummy_install(&prefix, "3.9.0");
         prefix.discard_incomplete().unwrap();
-        let good = prefix.last_good_version().unwrap();
+        let good = prefix
+            .complete_versions_desc()
+            .unwrap()
+            .first()
+            .cloned()
+            .unwrap();
         prefix.activate(&good).unwrap();
         assert_eq!(prefix.active_version().as_deref(), Some("3.8.44"));
     }
