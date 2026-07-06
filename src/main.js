@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LogicalSize } from "@tauri-apps/api/dpi";
-import { PROVIDER_ICONS } from "./icons.js";
+import { PROVIDER_ICONS, GITHUB_ICON } from "./icons.js";
 
 const STATE_LABELS = {
   stopped: "Stopped",
@@ -576,11 +576,16 @@ function fitWindow() {
 getCurrentWindow().listen("run-doctor", runDoctor);
 
 document.getElementById("gear-btn")?.addEventListener("click", toggleSettings);
-document.getElementById("help-btn")?.addEventListener("click", () => {
-  invoke("open_url", { url: "https://github.com/zoispag/omniroute-tray" }).catch(
-    () => {}
-  );
-});
+const helpBtn = document.getElementById("help-btn");
+if (helpBtn) {
+  helpBtn.innerHTML = GITHUB_ICON;
+  helpBtn.title = "View on GitHub";
+  helpBtn.addEventListener("click", () => {
+    invoke("open_url", {
+      url: "https://github.com/zoispag/omniroute-tray",
+    }).catch(() => {});
+  });
+}
 
 async function tick() {
   await refresh();
