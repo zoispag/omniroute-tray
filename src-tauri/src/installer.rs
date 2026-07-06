@@ -21,8 +21,22 @@ pub enum InstallError {
     },
     #[error("npm install failed: {0}")]
     NpmFailed(String),
+    #[error("install verification failed: {0}")]
+    Incomplete(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl InstallError {
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            InstallError::NpmFailed(_)
+                | InstallError::Incomplete(_)
+                | InstallError::Registry(_)
+                | InstallError::Io(_)
+        )
+    }
 }
 
 pub struct NodeRuntime {
@@ -140,12 +154,50 @@ pub fn install_version(
     prefix.ensure_layout()?;
     let dir = prefix.version_dir(version);
     if !prefix.is_version_complete(version) {
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir)?;
-        node.npm_install(&format!("omniroute@{version}"), &dir)?;
-        prefix.mark_complete(version)?;
+        if let Err(e) = download_and_verify(prefix, node, version, &dir) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e);
+        }
     }
     prefix.activate(version)?;
+    verify_install(prefix, version)?;
+    Ok(())
+}
+
+fn download_and_verify(
+    prefix: &Prefix,
+    node: &NodeRuntime,
+    version: &str,
+    dir: &Path,
+) -> Result<(), InstallError> {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir)?;
+    node.npm_install(&format!("omniroute@{version}"), dir)?;
+    verify_install(prefix, version)?;
+    prefix.mark_complete(version)?;
+    Ok(())
+}
+
+fn verify_install(prefix: &Prefix, version: &str) -> Result<(), InstallError> {
+    let entry = prefix.omniroute_entry(version);
+    if !entry.is_file() {
+        return Err(InstallError::Incomplete(format!(
+            "omniroute entry missing after install: {}",
+            entry.display()
+        )));
+    }
+    let pkg = prefix.omniroute_package_json(version);
+    let raw = std::fs::read_to_string(&pkg)
+        .map_err(|e| InstallError::Incomplete(format!("cannot read package.json: {e}")))?;
+    let installed = raw
+        .split_once("\"version\"")
+        .and_then(|(_, rest)| rest.split('"').nth(1))
+        .unwrap_or_default();
+    if installed != version {
+        return Err(InstallError::Incomplete(format!(
+            "version mismatch: expected {version}, found {installed}"
+        )));
+    }
     Ok(())
 }
 
@@ -164,4 +216,60 @@ pub fn ensure_installed(
     }
     install_version(prefix, node, pinned)?;
     Ok(pinned.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_pkg(prefix: &Prefix, version: &str, pkg_version: &str) {
+        let bin = prefix
+            .omniroute_entry(version)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(prefix.omniroute_entry(version), b"// entry").unwrap();
+        std::fs::write(
+            prefix.omniroute_package_json(version),
+            format!("{{\n  \"name\": \"omniroute\",\n  \"version\": \"{pkg_version}\"\n}}"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn verify_passes_when_entry_and_version_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prefix = Prefix::new(tmp.path());
+        write_pkg(&prefix, "3.8.44", "3.8.44");
+        assert!(verify_install(&prefix, "3.8.44").is_ok());
+    }
+
+    #[test]
+    fn verify_fails_when_entry_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prefix = Prefix::new(tmp.path());
+        let err = verify_install(&prefix, "3.8.44").unwrap_err();
+        assert!(matches!(err, InstallError::Incomplete(_)));
+    }
+
+    #[test]
+    fn verify_fails_on_version_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prefix = Prefix::new(tmp.path());
+        write_pkg(&prefix, "3.8.44", "3.8.45");
+        let err = verify_install(&prefix, "3.8.44").unwrap_err();
+        assert!(matches!(err, InstallError::Incomplete(_)));
+    }
+
+    #[test]
+    fn engine_incompatible_is_not_transient() {
+        let e = InstallError::EngineIncompatible {
+            version: "9.9.9".into(),
+            required: ">=99".into(),
+            bundled: "24.18.0".into(),
+        };
+        assert!(!e.is_transient());
+        assert!(InstallError::Incomplete("x".into()).is_transient());
+    }
 }

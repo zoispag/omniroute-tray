@@ -38,6 +38,21 @@ impl Prefix {
         self.versions_dir().join(version)
     }
 
+    pub fn omniroute_entry(&self, version: &str) -> PathBuf {
+        self.version_dir(version)
+            .join("node_modules")
+            .join("omniroute")
+            .join("bin")
+            .join("omniroute.mjs")
+    }
+
+    pub fn omniroute_package_json(&self, version: &str) -> PathBuf {
+        self.version_dir(version)
+            .join("node_modules")
+            .join("omniroute")
+            .join("package.json")
+    }
+
     pub fn ensure_layout(&self) -> Result<(), RuntimeError> {
         fs::create_dir_all(self.versions_dir())?;
         Ok(())

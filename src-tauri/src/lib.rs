@@ -61,8 +61,27 @@ fn stop_managed_server(app: &tauri::AppHandle) {
     }
 }
 
+fn install_with_retry(
+    prefix: &runtime::Prefix,
+    node: &installer::NodeRuntime,
+) -> Result<String, installer::InstallError> {
+    let backoffs = [2u64, 8, 20];
+    let mut attempt = 0;
+    loop {
+        match installer::ensure_installed(prefix, node, paths::PINNED_OMNIROUTE) {
+            Ok(v) => return Ok(v),
+            Err(e) if e.is_transient() && attempt < backoffs.len() => {
+                log::warn!("install attempt {} failed: {e}; retrying", attempt + 1);
+                std::thread::sleep(std::time::Duration::from_secs(backoffs[attempt]));
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 fn bootstrap(app: tauri::AppHandle) {
-    use installer::{ensure_installed, NodeRuntime};
+    use installer::NodeRuntime;
     use runtime::Prefix;
     use supervisor::Supervisor;
 
@@ -99,7 +118,7 @@ fn bootstrap(app: tauri::AppHandle) {
     let prefix = Prefix::new(&paths.prefix_root);
     let node = NodeRuntime::new(&node_root);
 
-    let version = match ensure_installed(&prefix, &node, paths::PINNED_OMNIROUTE) {
+    let version = match install_with_retry(&prefix, &node) {
         Ok(v) => v,
         Err(e) => {
             set_state(
