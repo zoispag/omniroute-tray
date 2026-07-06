@@ -241,7 +241,7 @@ fn toggle_popover(app: &tauri::AppHandle) {
     if window.is_visible().unwrap_or(false) {
         let _ = window.hide();
     } else {
-        let _ = window.move_window(Position::TrayCenter);
+        let _ = window.move_window_constrained(Position::TrayCenter);
         let _ = window.show();
         let _ = window.set_focus();
     }
@@ -502,7 +502,7 @@ pub fn run() {
                             app.state::<AppState>()
                                 .pin_open
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
-                            let _ = window.move_window(Position::TrayCenter);
+                            let _ = window.move_window_constrained(Position::TrayCenter);
                             let _ = window.show();
                             let _ = window.set_focus();
                             let _ = window.emit("run-doctor", ());
