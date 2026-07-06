@@ -8,7 +8,7 @@ Built with [Tauri v2](https://v2.tauri.app/) (Rust backend + web popover UI).
 
 - **Tray-only** — a rich menu-bar popover, no dock icon.
 - **Supervised server** — spawns and keeps `omniroute serve` running, adopting an already-running instance instead of spawning a duplicate.
-- **Bundled Node runtime** — ships its own signed Node 26.x and manages an app-owned OmniRoute install; does not depend on your global `bun`/`npm`.
+- **Bundled Node runtime** — ships its own signed Node 24.x LTS and manages an app-owned OmniRoute install; does not depend on your global `bun`/`npm`.
 - **Live usage** — provider quota bars, Claude Session/Weekly limits with reset countdowns (`% left` / `% used` toggle), and a 30-day cost breakdown.
 - **Auto-update** — detects new OmniRoute releases and updates in place (staged install, atomic swap, rollback on failure).
 - **Start on login** — optional launch at login.

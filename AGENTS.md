@@ -22,13 +22,13 @@ A macOS-first (Tauri v2) **tray-only** menu-bar app that supervises, monitors, a
 
 ```sh
 npm install
-bash scripts/fetch-node.sh                    # bundle Node 26.x (checksum-verified)
+bash scripts/fetch-node.sh                    # bundle Node 24.x LTS (checksum-verified)
 cargo test --manifest-path src-tauri/Cargo.toml
 npm run tauri build -- --bundles app          # build .app
 open src-tauri/target/release/bundle/macos/OmniRouteTray.app
 ```
 
-Toolchain: cargo in `~/.cargo/bin` (add to PATH). Node 26.4.0 bundled; system Node is unrelated.
+Toolchain: cargo in `~/.cargo/bin` (add to PATH). Node 24.18.0 (LTS) bundled; system Node is unrelated. Node 24 is required: omniroute 3.8.45 declares `engines.node >=22 <23 || >=24 <27` but empirically HANGS on all real routes under Node 26 (event loop spins on unresolved async; `/health` 404s fast while `/api/*` and SSR pages never respond). Node 24 responds instantly. Do not bump the bundled Node into the 26 range until upstream omniroute is verified working on it.
 
 ## Architecture (Rust modules in src-tauri/src/)
 
