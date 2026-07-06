@@ -134,6 +134,11 @@ pub fn parse_usage(raw: &str) -> Result<Vec<Window>, RateLimitError> {
             unlimited,
         });
     }
+
+    if windows.is_empty() {
+        windows = aggregate_per_model(quotas);
+    }
+
     windows.sort_by_key(|w| window_order(&w.label));
     Ok(windows)
 }
@@ -185,6 +190,86 @@ fn pretty_label(key: &str) -> String {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
         None => key.to_string(),
     }
+}
+
+fn aggregate_per_model(quotas: &serde_json::Map<String, Value>) -> Vec<Window> {
+    use std::collections::BTreeMap;
+    let mut groups: BTreeMap<String, (f64, bool)> = BTreeMap::new();
+    for q in quotas.values() {
+        let Some(reset) = q.get("resetAt").and_then(Value::as_str) else {
+            continue;
+        };
+        let used = used_percent_of(q);
+        let unlimited = q.get("unlimited").and_then(Value::as_bool).unwrap_or(false);
+        let entry = groups.entry(reset.to_string()).or_insert((0.0, true));
+        if used > entry.0 {
+            entry.0 = used;
+        }
+        entry.1 = entry.1 && unlimited;
+    }
+
+    let mut windows: Vec<Window> = groups
+        .into_iter()
+        .map(|(reset, (used, unlimited))| Window {
+            label: reset_bucket_label(&reset),
+            short: reset_bucket_short(&reset),
+            used_percent: used,
+            reset_at: Some(reset),
+            unlimited,
+        })
+        .collect();
+    windows.sort_by(|a, b| a.reset_at.cmp(&b.reset_at));
+    windows
+}
+
+fn reset_bucket_label(_reset: &str) -> String {
+    "Quota".to_string()
+}
+
+fn reset_bucket_short(reset: &str) -> String {
+    let mins = minutes_until(reset);
+    match mins {
+        Some(m) if m >= 25 * 1440 => "mo".to_string(),
+        Some(m) if m >= 5 * 1440 => "wk".to_string(),
+        Some(m) if m >= 1440 => "1d".to_string(),
+        Some(_) => "5h".to_string(),
+        None => "win".to_string(),
+    }
+}
+
+fn minutes_until(reset: &str) -> Option<i64> {
+    let ts = chrono_parse_millis(reset)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as i64;
+    Some((ts - now) / 60_000)
+}
+
+fn chrono_parse_millis(iso: &str) -> Option<i64> {
+    let date = &iso.get(0..10)?;
+    let time = iso.get(11..19).unwrap_or("00:00:00");
+    let (y, m, d) = (
+        date.get(0..4)?.parse::<i64>().ok()?,
+        date.get(5..7)?.parse::<i64>().ok()?,
+        date.get(8..10)?.parse::<i64>().ok()?,
+    );
+    let (hh, mm, ss) = (
+        time.get(0..2)?.parse::<i64>().ok()?,
+        time.get(3..5)?.parse::<i64>().ok()?,
+        time.get(6..8)?.parse::<i64>().ok()?,
+    );
+    let days = days_from_civil(y, m, d);
+    Some(((days * 86400) + hh * 3600 + mm * 60 + ss) * 1000)
+}
+
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
 }
 
 fn is_time_window(key: &str) -> bool {
@@ -267,6 +352,38 @@ mod tests {
     #[test]
     fn no_quotas_yields_empty() {
         assert!(parse_usage(r#"{"plan":"x"}"#).unwrap().is_empty());
+    }
+
+    #[test]
+    fn aggregates_per_model_windows_by_reset_when_no_time_window() {
+        let raw = r#"{"quotas":{
+          "gemini-2.5-flash":{"used":0,"total":1000,"resetAt":"2026-07-13T08:50:26.000Z","remainingPercentage":100},
+          "gemini-3.5-flash-high":{"used":800,"total":1000,"resetAt":"2026-07-13T08:50:26.000Z","remainingPercentage":20},
+          "gemini-3.1-flash-lite":{"used":0,"total":1000,"resetAt":"2026-07-07T08:50:26.000Z","remainingPercentage":100}
+        }}"#;
+        let w = parse_usage(raw).unwrap();
+        assert_eq!(
+            w.len(),
+            2,
+            "two distinct reset windows -> two aggregated rows"
+        );
+        let by_reset: std::collections::HashMap<_, _> = w
+            .iter()
+            .map(|x| (x.reset_at.clone().unwrap(), x.used_percent))
+            .collect();
+        assert_eq!(
+            by_reset["2026-07-13T08:50:26.000Z"], 80.0,
+            "most-used model wins"
+        );
+        assert_eq!(by_reset["2026-07-07T08:50:26.000Z"], 0.0);
+    }
+
+    #[test]
+    fn time_window_present_skips_aggregation() {
+        let w = parse_usage(USAGE).unwrap();
+        assert!(w
+            .iter()
+            .all(|x| x.label == "Session" || x.label == "Weekly"));
     }
 
     #[test]
