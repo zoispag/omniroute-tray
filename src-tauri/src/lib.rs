@@ -16,7 +16,7 @@ mod updater;
 
 use std::sync::Mutex;
 
-use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder};
+use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, WindowEvent};
 use tauri_plugin_autostart::ManagerExt;
@@ -169,6 +169,36 @@ fn bootstrap(app: tauri::AppHandle) {
     }
 
     *app.state::<AppState>().supervisor.lock().unwrap() = Some(supervisor);
+
+    monitor_health(app, version);
+}
+
+fn monitor_health(app: tauri::AppHandle, version: String) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let healthy = supervisor::server_healthy(20128);
+        let app_state = app.state::<AppState>();
+        let current = app_state.server.lock().unwrap().clone();
+        match (&current, healthy) {
+            (ServerState::Running { .. } | ServerState::UpdateAvailable { .. }, false) => {
+                set_state(
+                    &app,
+                    ServerState::Error {
+                        reason: "OmniRoute server is not responding on :20128".into(),
+                    },
+                );
+            }
+            (ServerState::Error { .. } | ServerState::Stopped, true) => {
+                set_state(
+                    &app,
+                    ServerState::Running {
+                        version: Some(version.clone()),
+                    },
+                );
+            }
+            _ => {}
+        }
+    });
 }
 
 fn check_for_update(app: &tauri::AppHandle, current: &str) {
@@ -206,6 +236,27 @@ fn get_status(state: tauri::State<AppState>) -> ServerState {
 #[tauri::command]
 fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
+}
+
+#[tauri::command]
+fn get_port() -> u16 {
+    20128
+}
+
+#[tauri::command]
+fn restart_server(app: tauri::AppHandle) {
+    stop_managed_server(&app);
+    let handle = app.clone();
+    std::thread::spawn(move || bootstrap(handle));
+}
+
+#[tauri::command]
+fn open_logs(app: tauri::AppHandle) -> Result<(), String> {
+    let paths = AppPaths::resolve(&app).map_err(|e| e.to_string())?;
+    let log = logfile::ServerLog::new(&paths.log_dir);
+    let _ = log.ensure_exists();
+    tauri_plugin_opener::open_path(log.path().display().to_string(), None::<&str>)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -306,6 +357,7 @@ fn apply_update(
 
     match updater::apply_update(&prefix, &node, &target) {
         Ok(new_version) => {
+            let _ = node.repair_runtime(&paths.current_omniroute_entry());
             *state.active_version.lock().unwrap() = Some(new_version.clone());
             set_state(
                 &app,
@@ -343,6 +395,16 @@ fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<bool, String> {
     manager.is_enabled().map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn get_autostart(app: tauri::AppHandle) -> bool {
+    app.autolaunch().is_enabled().unwrap_or(false)
+}
+
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    tauri_plugin_opener::open_url(url, None::<&str>).map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -377,17 +439,11 @@ pub fn run() {
             let restart = MenuItemBuilder::with_id("restart", "Restart Server").build(app)?;
             let doctor = MenuItemBuilder::with_id("doctor", "Run Doctor").build(app)?;
             let logs = MenuItemBuilder::with_id("logs", "View Logs").build(app)?;
-            let autostart_enabled = app.autolaunch().is_enabled().unwrap_or(false);
-            let start_on_login = CheckMenuItemBuilder::with_id("start_on_login", "Start on Login")
-                .checked(autostart_enabled)
-                .build(app)?;
             let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
             let menu = MenuBuilder::new(app)
                 .items(&[&dashboard, &restart])
                 .separator()
                 .items(&[&doctor, &logs])
-                .separator()
-                .items(&[&start_on_login])
                 .separator()
                 .items(&[&quit])
                 .build()?;
@@ -417,7 +473,11 @@ pub fn run() {
                         let _ =
                             tauri_plugin_opener::open_url("http://127.0.0.1:20128", None::<&str>);
                     }
-                    "restart" => log::info!("restart requested"),
+                    "restart" => {
+                        stop_managed_server(app);
+                        let handle = app.clone();
+                        std::thread::spawn(move || bootstrap(handle));
+                    }
                     "doctor" => {
                         if let Some(window) = app.get_webview_window(POPOVER_LABEL) {
                             app.state::<AppState>()
@@ -437,14 +497,6 @@ pub fn run() {
                                 log.path().display().to_string(),
                                 None::<&str>,
                             );
-                        }
-                    }
-                    "start_on_login" => {
-                        let manager = app.autolaunch();
-                        if manager.is_enabled().unwrap_or(false) {
-                            let _ = manager.disable();
-                        } else {
-                            let _ = manager.enable();
                         }
                     }
                     _ => {}
@@ -477,7 +529,12 @@ pub fn run() {
             get_rate_limits,
             get_usage_trend,
             get_app_version,
+            get_port,
+            restart_server,
+            open_logs,
             set_autostart,
+            get_autostart,
+            open_url,
             run_doctor,
             get_log_path,
             apply_update
