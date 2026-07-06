@@ -44,19 +44,59 @@ impl NodeRuntime {
         }
     }
 
+    // npm lifecycle scripts (e.g. better-sqlite3's `prebuild-install || node-gyp
+    // rebuild`) invoke bare `node`. Under launchd our bundled node bin is not on
+    // PATH and there is no system node, so scripts fail with code 127. Prepend it.
+    fn child_path(&self) -> std::ffi::OsString {
+        let bin_dir = self
+            .node_bin
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        match std::env::var_os("PATH") {
+            Some(existing) => {
+                let mut joined = bin_dir.into_os_string();
+                joined.push(":");
+                joined.push(existing);
+                joined
+            }
+            None => bin_dir.into_os_string(),
+        }
+    }
+
     pub fn version(&self) -> Result<String, InstallError> {
         let out = Command::new(&self.node_bin).arg("--version").output()?;
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
     pub fn repair_runtime(&self, omniroute_entry: &Path) -> Result<(), InstallError> {
+        let omniroute_root = omniroute_entry
+            .parent()
+            .and_then(|p| p.parent())
+            .ok_or_else(|| InstallError::NpmFailed("cannot resolve omniroute root".into()))?;
+        let dist = omniroute_root.join("dist");
+
+        // `omniroute runtime repair` reports success but does NOT rebuild the
+        // dist/node_modules/better-sqlite3 copy the server dlopen's, so the
+        // native ABI mismatch persists. Rebuild it directly against our node.
+        let target = if dist.join("node_modules").join("better-sqlite3").is_dir() {
+            &dist
+        } else {
+            omniroute_root
+        };
+
         let status = Command::new(&self.node_bin)
-            .arg(omniroute_entry)
-            .arg("runtime")
-            .arg("repair")
+            .arg(&self.npm_cli)
+            .arg("rebuild")
+            .arg("better-sqlite3")
+            .arg("--prefix")
+            .arg(target)
+            .env("PATH", self.child_path())
             .status()?;
         if !status.success() {
-            return Err(InstallError::NpmFailed("runtime repair failed".into()));
+            return Err(InstallError::NpmFailed(
+                "better-sqlite3 rebuild failed".into(),
+            ));
         }
         Ok(())
     }
@@ -69,6 +109,7 @@ impl NodeRuntime {
             .arg("--no-audit")
             .arg("--no-fund")
             .arg("--foreground-scripts")
+            .env("PATH", self.child_path())
             .current_dir(cwd)
             .status()?;
         if !status.success() {

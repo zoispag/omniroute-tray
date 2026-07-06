@@ -44,7 +44,7 @@ jobs:
       - name: Fetch bundled Node runtime
         run: bash scripts/fetch-node.sh
         env:
-          NODE_VERSION: v26.4.0
+          NODE_VERSION: v24.18.0
 
       - name: Build app (Developer ID if configured, else ad-hoc)
         env:

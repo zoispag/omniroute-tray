@@ -33,6 +33,7 @@ pub struct UsageTrend {
 pub fn fetch(base_url: &str, api_key: &str, period: &str) -> Result<UsageTrend, AnalyticsError> {
     let url = format!("{base_url}/api/usage/analytics?period={period}");
     let body = match ureq::get(&url)
+        .timeout(std::time::Duration::from_secs(4))
         .set("Authorization", &format!("Bearer {api_key}"))
         .call()
     {

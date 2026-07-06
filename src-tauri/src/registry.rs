@@ -36,6 +36,7 @@ struct VersionDoc {
 pub fn latest_version() -> Result<String, RegistryError> {
     let url = format!("{REGISTRY_BASE}/{PACKAGE}");
     let doc: PackageDoc = ureq::get(&url)
+        .timeout(std::time::Duration::from_secs(8))
         .call()
         .map_err(|e| RegistryError::Network(e.to_string()))?
         .into_json()
@@ -45,10 +46,13 @@ pub fn latest_version() -> Result<String, RegistryError> {
 
 pub fn engines_node(version: &str) -> Result<Option<String>, RegistryError> {
     let url = format!("{REGISTRY_BASE}/{PACKAGE}/{version}");
-    let response = ureq::get(&url).call().map_err(|e| match e {
-        ureq::Error::Status(404, _) => RegistryError::VersionNotFound(version.to_string()),
-        other => RegistryError::Network(other.to_string()),
-    })?;
+    let response = ureq::get(&url)
+        .timeout(std::time::Duration::from_secs(8))
+        .call()
+        .map_err(|e| match e {
+            ureq::Error::Status(404, _) => RegistryError::VersionNotFound(version.to_string()),
+            other => RegistryError::Network(other.to_string()),
+        })?;
     let doc: VersionDoc = response
         .into_json()
         .map_err(|e| RegistryError::Network(e.to_string()))?;
