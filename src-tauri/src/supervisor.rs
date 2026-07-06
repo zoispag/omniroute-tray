@@ -42,6 +42,17 @@ pub fn decide(
     }
 }
 
+pub fn server_healthy(port: u16) -> bool {
+    let url = format!("http://127.0.0.1:{port}/api/monitoring/health");
+    match ureq::get(&url).timeout(Duration::from_secs(2)).call() {
+        Ok(resp) => resp
+            .into_string()
+            .map(|b| b.contains("\"status\":\"healthy\""))
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
 pub fn port_alive(port: u16) -> bool {
     let addr = format!("127.0.0.1:{port}");
     match addr.to_socket_addrs() {
@@ -54,6 +65,7 @@ pub fn port_alive(port: u16) -> bool {
 }
 
 #[cfg(unix)]
+#[allow(dead_code)]
 pub fn pid_alive(pid: u32) -> bool {
     unsafe { libc_kill(pid as i32, 0) == 0 }
 }
@@ -85,6 +97,7 @@ fn kill_process_group(pid: u32) {
 }
 
 #[cfg(not(unix))]
+#[allow(dead_code)]
 pub fn pid_alive(_pid: u32) -> bool {
     false
 }
@@ -146,6 +159,12 @@ impl Supervisor {
             .arg("--port")
             .arg(self.port.to_string());
 
+        if let Some(node_dir) = self.node_bin.parent() {
+            let existing = std::env::var("PATH").unwrap_or_default();
+            let new_path = format!("{}:{existing}", node_dir.display());
+            command.env("PATH", new_path);
+        }
+
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -173,9 +192,8 @@ impl Supervisor {
 
     pub fn reconcile(&mut self) -> Result<Reconciliation, SupervisorError> {
         let lock = self.lockfile.read()?;
-        let alive = port_alive(self.port);
-        let pid_ok = lock.as_ref().map(|r| pid_alive(r.pid)).unwrap_or(false);
-        let decision = decide(lock.as_ref(), alive, pid_ok, &self.token);
+        let alive = self.server_present();
+        let decision = decide(lock.as_ref(), alive, alive, &self.token);
         match decision {
             Reconciliation::SpawnFresh => {
                 self.lockfile.clear()?;
@@ -188,23 +206,42 @@ impl Supervisor {
     }
 
     #[allow(dead_code)]
+    fn server_present(&self) -> bool {
+        for attempt in 0..3 {
+            if server_healthy(self.port) || port_alive(self.port) {
+                return true;
+            }
+            if attempt < 2 {
+                std::thread::sleep(Duration::from_millis(600));
+            }
+        }
+        false
+    }
+
     pub fn wait_ready(&self, timeout: Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         while std::time::Instant::now() < deadline {
-            if port_alive(self.port) {
+            if server_healthy(self.port) {
                 return true;
             }
-            std::thread::sleep(Duration::from_millis(400));
+            std::thread::sleep(Duration::from_millis(500));
         }
-        port_alive(self.port)
+        server_healthy(self.port)
     }
 
     pub fn stop(&mut self) -> Result<(), SupervisorError> {
         if let Some(mut child) = self.child.take() {
-            let pid = child.id();
-            #[cfg(unix)]
-            kill_process_group(pid);
-            let _ = child.kill();
+            let mut stop_cmd = Command::new(&self.node_bin);
+            stop_cmd
+                .arg(&self.omniroute_entry)
+                .arg("stop")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if let Some(node_dir) = self.node_bin.parent() {
+                let existing = std::env::var("PATH").unwrap_or_default();
+                stop_cmd.env("PATH", format!("{}:{existing}", node_dir.display()));
+            }
+            let _ = stop_cmd.status();
             let _ = child.wait();
         }
         self.lockfile.clear()?;
@@ -265,6 +302,27 @@ mod tests {
             decide(Some(&rec), false, false, "mine"),
             Reconciliation::SpawnFresh
         );
+    }
+
+    #[test]
+    fn stop_without_owned_child_only_clears_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sup = Supervisor::new(
+            PathBuf::from("/nonexistent/node"),
+            PathBuf::from("/nonexistent/omniroute.mjs"),
+            dir.path().to_path_buf(),
+            "mine".into(),
+        );
+        sup.lockfile
+            .write(&LockRecord {
+                pid: 999,
+                port: DEFAULT_PORT,
+                token: "mine".into(),
+            })
+            .unwrap();
+        assert!(sup.child.is_none());
+        sup.stop().unwrap();
+        assert!(sup.lockfile.read().unwrap().is_none());
     }
 
     #[test]
