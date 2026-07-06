@@ -303,9 +303,9 @@ function resetMinutes(value) {
   } else {
     then = new Date(value).getTime();
   }
+  if (Number.isNaN(then)) return null;
   const diff = then - Date.now();
-  if (Number.isNaN(then) || diff <= 0) return null;
-  return Math.floor(diff / 6e4);
+  return Math.max(0, Math.floor(diff / 6e4));
 }
 
 function refineLabel(short, resetAt) {
@@ -322,6 +322,7 @@ function refineLabel(short, resetAt) {
 function formatResetShort(value) {
   const totalMin = resetMinutes(value);
   if (totalMin == null) return "";
+  if (totalMin === 0) return "now";
   const d = Math.floor(totalMin / 1440);
   const h = Math.floor((totalMin % 1440) / 60);
   const m = totalMin % 60;
