@@ -75,9 +75,9 @@ To enable it:
 1. Create a GitHub App (Settings → Developer settings → GitHub Apps) with **Repository permissions → Contents: Read and write**.
 2. Install the App on the `homebrew-tap` repository.
 3. Generate a private key for the App.
-4. In the `omniroute-tray` repo, add:
-   - Variable `TAP_APP_ID` = the App's ID.
-   - Secret `TAP_APP_PRIVATE_KEY` = the generated `.pem` contents.
+4. In the `omniroute-tray` repo, add secrets:
+   - `TAP_APP_ID` = the App's ID.
+   - `TAP_APP_PRIVATE_KEY` = the generated `.pem` contents.
 
 If these are absent, the release still publishes; only the Cask auto-update step is skipped.
 
