@@ -47,13 +47,13 @@ mod tests {
 
     #[test]
     fn accepts_version_in_range() {
-        let verdict = check_engine(Some(">=22.0.0 <23 || >=24.0.0 <27"), "26.5.0");
+        let verdict = check_engine(Some(">=22.0.0 <23 || >=24.0.0 <27"), "24.5.0");
         assert_eq!(verdict, EngineVerdict::Compatible);
     }
 
     #[test]
     fn blocks_version_requiring_newer_node() {
-        let verdict = check_engine(Some(">=27.0.0"), "26.5.0");
+        let verdict = check_engine(Some(">=27.0.0"), "24.5.0");
         assert!(matches!(verdict, EngineVerdict::Incompatible { .. }));
     }
 
@@ -65,12 +65,12 @@ mod tests {
 
     #[test]
     fn unknown_when_no_constraint() {
-        assert_eq!(check_engine(None, "26.5.0"), EngineVerdict::Unknown);
+        assert_eq!(check_engine(None, "24.5.0"), EngineVerdict::Unknown);
     }
 
     #[test]
     fn strips_leading_v_from_bundled() {
-        let verdict = check_engine(Some(">=24.0.0 <27"), "v26.5.0");
+        let verdict = check_engine(Some(">=24.0.0 <27"), "v24.5.0");
         assert_eq!(verdict, EngineVerdict::Compatible);
     }
 }
