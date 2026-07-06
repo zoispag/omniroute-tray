@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
 
 jobs:
@@ -10,6 +10,10 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -23,6 +27,16 @@ jobs:
             ~/.cargo/git
             src-tauri/target
           key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+
+      - name: Build frontend (tauri-build needs dist/)
+        run: |
+          npm ci
+          npm run build
+
+      - name: Fetch bundled Node runtime (tauri-build validates resources/node)
+        run: bash scripts/fetch-node.sh
+        env:
+          NODE_VERSION: v26.4.0
 
       - name: Format check
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
