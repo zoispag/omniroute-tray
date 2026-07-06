@@ -141,10 +141,44 @@ body {
 .account {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 6px;
   font-weight: 700;
   font-size: 12px;
   margin: 2px 0 5px;
+}
+
+.acct-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prov-badge {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.prov-badge svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+
+.prov-codex {
+  color: #10a37f;
+}
+
+.prov-fallback {
+  color: var(--text-faint);
+  font-size: 10px;
+}
+
+.acct-toggle {
+  margin-left: auto;
 }
 
 .account:not(:first-child) {
