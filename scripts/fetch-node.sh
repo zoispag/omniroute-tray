@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-NODE_VERSION="${NODE_VERSION:-v26.4.0}"
+NODE_VERSION="${NODE_VERSION:-v24.18.0}"
 DEST="src-tauri/resources/node"
 
 case "$(uname -s)-$(uname -m)" in
