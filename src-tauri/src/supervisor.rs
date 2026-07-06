@@ -188,6 +188,17 @@ impl Supervisor {
     }
 
     #[allow(dead_code)]
+    pub fn wait_ready(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if port_alive(self.port) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(400));
+        }
+        port_alive(self.port)
+    }
+
     pub fn stop(&mut self) -> Result<(), SupervisorError> {
         if let Some(mut child) = self.child.take() {
             let pid = child.id();

@@ -31,7 +31,8 @@ async function refresh() {
 
 function renderUpdate(status) {
   const el = document.getElementById("update");
-  if (status.state === "update-available") {
+  if (!el) return;
+  if (status.state === "update-available" && status.latest) {
     el.innerHTML = `<button id="update-btn">Update to v${status.latest}</button>`;
     document.getElementById("update-btn").onclick = async (e) => {
       e.target.disabled = true;
@@ -58,12 +59,11 @@ function renderHeader(status) {
   document.getElementById("version").textContent = status.version
     ? `v${status.version}`
     : "";
+  const errEl = document.getElementById("error");
   if (status.state === "error" && status.reason) {
-    document.getElementById("content").innerHTML =
-      `<p class="error">${status.reason}</p>`;
-  } else if (status.state !== "error") {
-    const err = document.querySelector("#content .error");
-    if (err) err.remove();
+    errEl.innerHTML = `<p class="error">${status.reason}</p>`;
+  } else {
+    errEl.innerHTML = "";
   }
 }
 

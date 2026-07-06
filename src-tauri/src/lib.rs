@@ -33,6 +33,7 @@ struct AppState {
     data: Mutex<Option<DataClient>>,
     active_version: Mutex<Option<String>>,
     api_key: Mutex<Option<String>>,
+    supervisor: Mutex<Option<supervisor::Supervisor>>,
     pin_open: std::sync::atomic::AtomicBool,
 }
 
@@ -43,6 +44,7 @@ impl AppState {
             data: Mutex::new(None),
             active_version: Mutex::new(None),
             api_key: Mutex::new(None),
+            supervisor: Mutex::new(None),
             pin_open: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -51,6 +53,12 @@ impl AppState {
 fn set_state(app: &tauri::AppHandle, next: ServerState) {
     let app_state = app.state::<AppState>();
     *app_state.server.lock().unwrap() = next;
+}
+
+fn stop_managed_server(app: &tauri::AppHandle) {
+    if let Some(mut sup) = app.state::<AppState>().supervisor.lock().unwrap().take() {
+        let _ = sup.stop();
+    }
 }
 
 fn bootstrap(app: tauri::AppHandle) {
@@ -126,15 +134,31 @@ fn bootstrap(app: tauri::AppHandle) {
     )
     .with_log(log);
 
+    use supervisor::Reconciliation;
     match supervisor.reconcile() {
-        Ok(_) => {
-            set_state(
-                &app,
-                ServerState::Running {
-                    version: Some(version.clone()),
-                },
-            );
-            check_for_update(&app, &version);
+        Ok(decision) => {
+            let ready = match decision {
+                Reconciliation::SpawnFresh => {
+                    supervisor.wait_ready(std::time::Duration::from_secs(20))
+                }
+                Reconciliation::Adopt | Reconciliation::ReconcileForeign => true,
+            };
+            if ready {
+                set_state(
+                    &app,
+                    ServerState::Running {
+                        version: Some(version.clone()),
+                    },
+                );
+                check_for_update(&app, &version);
+            } else {
+                set_state(
+                    &app,
+                    ServerState::Error {
+                        reason: "server did not start within 20s (see View Logs)".into(),
+                    },
+                );
+            }
         }
         Err(e) => set_state(
             &app,
@@ -143,6 +167,8 @@ fn bootstrap(app: tauri::AppHandle) {
             },
         ),
     }
+
+    *app.state::<AppState>().supervisor.lock().unwrap() = Some(supervisor);
 }
 
 fn check_for_update(app: &tauri::AppHandle, current: &str) {
@@ -383,7 +409,10 @@ pub fn run() {
                     }
                 })
                 .on_menu_event(|app, event| match event.id().as_ref() {
-                    "quit" => app.exit(0),
+                    "quit" => {
+                        stop_managed_server(app);
+                        app.exit(0);
+                    }
                     "dashboard" => {
                         let _ =
                             tauri_plugin_opener::open_url("http://127.0.0.1:20128", None::<&str>);

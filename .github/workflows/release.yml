@@ -79,3 +79,31 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: src-tauri/target/release/bundle/dmg/*.dmg
+
+      - name: Generate tap token
+        id: tap_token
+        if: startsWith(github.ref, 'refs/tags/') && vars.TAP_APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.TAP_APP_ID }}
+          private-key: ${{ secrets.TAP_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: homebrew-tap
+
+      - name: Update Homebrew Cask
+        if: steps.tap_token.outputs.token != ''
+        env:
+          TAP_TOKEN: ${{ steps.tap_token.outputs.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          DMG=$(find src-tauri/target/release/bundle/dmg -name "*.dmg" | head -1)
+          SHA=$(shasum -a 256 "$DMG" | awk '{print $1}')
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/${GITHUB_REPOSITORY_OWNER}/homebrew-tap.git" tap
+          sed -e "s/{{VERSION}}/${VERSION}/" -e "s/{{SHA256}}/${SHA}/" \
+            .github/cask.rb.tmpl > tap/Casks/omniroute-tray.rb
+          cd tap
+          git config user.name "omniroute-tray[bot]"
+          git config user.email "omniroute-tray[bot]@users.noreply.github.com"
+          git add Casks/omniroute-tray.rb
+          git commit -m "omniroute-tray ${VERSION}" || exit 0
+          git push

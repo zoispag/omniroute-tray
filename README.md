@@ -66,6 +66,21 @@ Release builds are ad-hoc signed by default. If you have an Apple Developer ID, 
 - `APPLE_SIGNING_IDENTITY`
 - `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`, `APPLE_TEAM_ID`
 
+## Homebrew tap automation
+
+On each tagged release the workflow updates the Cask in the `homebrew-tap` repo (new version + DMG checksum). Cross-repo pushes use a GitHub App token (short-lived, scoped to the tap), not a personal token.
+
+To enable it:
+
+1. Create a GitHub App (Settings → Developer settings → GitHub Apps) with **Repository permissions → Contents: Read and write**.
+2. Install the App on the `homebrew-tap` repository.
+3. Generate a private key for the App.
+4. In the `omniroute-tray` repo, add:
+   - Variable `TAP_APP_ID` = the App's ID.
+   - Secret `TAP_APP_PRIVATE_KEY` = the generated `.pem` contents.
+
+If these are absent, the release still publishes; only the Cask auto-update step is skipped.
+
 ## License
 
 MIT
