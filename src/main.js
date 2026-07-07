@@ -21,6 +21,8 @@ let lastStatus = null;
 let showUsed = localStorage.getItem("quotaMode") === "used";
 let showInactiveProviders =
   localStorage.getItem("showInactiveProviders") === "true";
+let costShowTokens = localStorage.getItem("costMode") === "tokens";
+let costCache = null;
 
 const SECTION_LABELS = [
   ["health", "Provider health"],
@@ -391,7 +393,14 @@ function formatResetAbsolute(value) {
 
 async function renderCost() {
   const result = await invoke("get_cost");
+  costCache = result;
+  paintCost();
+}
+
+function paintCost() {
   const section = document.getElementById("cost");
+  if (!section || !costCache) return;
+  const result = costCache;
   if (result.status === "needs-api-key") {
     section.innerHTML = `<a class="connect" href="http://127.0.0.1:20128" target="_blank">Connect API key →</a>`;
     return;
@@ -406,32 +415,35 @@ async function renderCost() {
     (s, r) => s + (r.tokens_in ?? 0) + (r.tokens_out ?? 0),
     0
   );
+  const toggle = `<button id="cost-toggle" class="mode-toggle">${
+    costShowTokens ? "in/out" : "%"
+  }</button>`;
   const top = rows
     .slice()
     .sort((a, b) => (b.cost ?? 0) - (a.cost ?? 0))
     .slice(0, 4)
     .map((r) => {
-      const share = total > 0 ? ((r.cost ?? 0) / total) * 100 : 0;
-      const tin = r.tokens_in ?? 0;
-      const tout = r.tokens_out ?? 0;
-      const sum = tin + tout;
-      const inPct = sum > 0 ? (tin / sum) * 100 : 0;
-      const tip = `${compactTokens(tin)} in · ${compactTokens(tout)} out`;
-      return `
-        <div class="cost-row">
-          <span class="cost-model">${r.model}</span>
-          <span class="cost-share">${share.toFixed(1)}%</span>
-        </div>
-        <div class="cost-bar" style="width:${Math.max(share, 3)}%" data-tip="${tip}">
-          <span class="cost-in" style="width:${inPct}%"></span>
-        </div>`;
+      const value = costShowTokens
+        ? `${compactTokens(r.tokens_in ?? 0)} in · ${compactTokens(
+            r.tokens_out ?? 0
+          )} out`
+        : `${(total > 0 ? ((r.cost ?? 0) / total) * 100 : 0).toFixed(1)}%`;
+      return `<div class="cost-row"><span class="cost-model">${r.model}</span><span class="cost-value">${value}</span></div>`;
     })
     .join("");
   section.innerHTML = `
-    <h3>Cost (30d)</h3>
+    <div class="section-head"><h3>Cost (30d)</h3>${toggle}</div>
     <div class="cost-total">$${total.toFixed(2)} · ${formatTokens(totalTokens)}</div>
-    ${top}
-    <div class="cost-legend"><span class="cost-swatch cost-swatch-in"></span>input<span class="cost-swatch cost-swatch-out"></span>output</div>`;
+    ${top}`;
+
+  const btn = document.getElementById("cost-toggle");
+  if (btn) {
+    btn.onclick = () => {
+      costShowTokens = !costShowTokens;
+      localStorage.setItem("costMode", costShowTokens ? "tokens" : "pct");
+      paintCost();
+    };
+  }
 }
 
 function formatTokens(n) {
