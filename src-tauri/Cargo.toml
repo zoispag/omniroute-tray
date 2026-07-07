@@ -1,6 +1,6 @@
 [package]
 name = "omniroute-tray"
-version = "0.1.7"
+version = "0.1.8"
 description = "A cross-platform tray app that supervises, monitors, and auto-updates the OmniRoute AI router."
 authors = ["OmniRouteTray contributors"]
 license = "MIT"

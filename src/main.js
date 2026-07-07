@@ -1,7 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LogicalSize } from "@tauri-apps/api/dpi";
-import { PROVIDER_ICONS, GITHUB_ICON } from "./icons.js";
+import {
+  PROVIDER_ICONS,
+  GITHUB_ICON,
+  GEAR_ICON,
+  REFRESH_ICON,
+} from "./icons.js";
 
 const STATE_LABELS = {
   stopped: "Stopped",
@@ -14,6 +19,28 @@ const STATE_LABELS = {
 
 let lastStatus = null;
 let showUsed = localStorage.getItem("quotaMode") === "used";
+let showInactiveProviders =
+  localStorage.getItem("showInactiveProviders") === "true";
+
+const SECTION_LABELS = [
+  ["health", "Provider health"],
+  ["usage", "Usage"],
+  ["cost", "Cost"],
+  ["trend", "Usage trend"],
+];
+let hiddenSections = new Set(
+  JSON.parse(localStorage.getItem("hiddenSections") || "[]")
+);
+
+function sectionVisible(key) {
+  return !hiddenSections.has(key);
+}
+
+function setSectionHidden(key, hidden) {
+  if (hidden) hiddenSections.add(key);
+  else hiddenSections.delete(key);
+  localStorage.setItem("hiddenSections", JSON.stringify([...hiddenSections]));
+}
 
 async function refresh() {
   try {
@@ -25,7 +52,12 @@ async function refresh() {
     }
     renderUpdate(status);
     if (status.state === "running" || status.state === "update-available") {
-      await Promise.all([renderRateLimits(), renderCost(), renderTrend()]);
+      const jobs = [];
+      jobs.push(sectionVisible("health") ? renderStatusBand() : hideSection("statusband"));
+      jobs.push(sectionVisible("usage") ? renderRateLimits() : hideSection("ratelimits"));
+      jobs.push(sectionVisible("cost") ? renderCost() : hideSection("cost"));
+      jobs.push(sectionVisible("trend") ? renderTrend() : hideSection("trend"));
+      await Promise.all(jobs);
     } else {
       clearSections();
     }
@@ -58,6 +90,7 @@ async function toggleSettings() {
 function mainContentHTML() {
   return `
     <div id="error" class="section"></div>
+    <div id="statusband" class="section"></div>
     <div id="ratelimits" class="section"></div>
     <div id="cost" class="section"></div>
     <div id="trend" class="section"></div>
@@ -493,6 +526,27 @@ async function renderSettings() {
       </label>
     </div>
     <div class="section">
+      <h3>Status Bar</h3>
+      <label class="set-toggle">
+        <input type="checkbox" id="inactive-providers-check" ${
+          showInactiveProviders ? "checked" : ""
+        } />
+        <span>Show inactive providers in the health strip</span>
+      </label>
+    </div>
+    <div class="section">
+      <h3>Sections</h3>
+      ${SECTION_LABELS.map(
+        ([key, label]) => `
+      <label class="set-toggle">
+        <input type="checkbox" class="section-check" data-section="${key}" ${
+          sectionVisible(key) ? "checked" : ""
+        } />
+        <span>${label}</span>
+      </label>`
+      ).join("")}
+    </div>
+    <div class="section">
       <h3>Accounts</h3>
       <ul class="set-list" id="set-list">${accountRows}</ul>
     </div>`;
@@ -507,6 +561,20 @@ async function renderSettings() {
       } catch {}
     };
   }
+
+  const inactive = document.getElementById("inactive-providers-check");
+  if (inactive) {
+    inactive.onchange = () => {
+      showInactiveProviders = inactive.checked;
+      localStorage.setItem(
+        "showInactiveProviders",
+        showInactiveProviders ? "true" : "false"
+      );
+    };
+  }
+  content.querySelectorAll(".section-check").forEach((c) => {
+    c.onchange = () => setSectionHidden(c.dataset.section, !c.checked);
+  });
   content.querySelectorAll(".set-check").forEach((c) => {
     c.onchange = () => setAccountHidden(c.dataset.key, !c.checked);
   });
@@ -528,20 +596,127 @@ function moveProvider(provider, dir) {
 
 async function renderVersion() {
   const el = document.getElementById("app-version");
-  if (el.textContent) return;
+  if (el.dataset.ready) return;
   try {
     const [version, port] = await Promise.all([
       invoke("get_app_version"),
       invoke("get_port"),
     ]);
-    el.textContent = `OmniRouteTray ${version} · :${port}`;
+    el.innerHTML = `<span class="app-name">OmniRouteTray ${version}</span><button class="port-link" id="port-link" title="Open OmniRoute dashboard">:${port}</button>`;
+    el.dataset.ready = "1";
+    document.getElementById("port-link")?.addEventListener("click", () => {
+      invoke("open_url", { url: `http://127.0.0.1:${port}` }).catch(() => {});
+    });
+    renderTrayUpdate();
   } catch {}
 }
 
+async function renderTrayUpdate() {
+  const help = document.getElementById("help-btn");
+  if (!help) return;
+  try {
+    const u = await invoke("get_tray_update");
+    if (u && u.available) {
+      help.classList.add("has-update");
+      help.title = `Update available: v${u.latest} — View on GitHub`;
+    }
+  } catch {}
+}
+
+function hideSection(id) {
+  const el = document.getElementById(id);
+  if (el) el.innerHTML = "";
+}
+
 function clearSections() {
+  const band = document.getElementById("statusband");
+  if (band) band.innerHTML = "";
   document.getElementById("ratelimits").innerHTML = "";
   document.getElementById("cost").innerHTML = "";
   document.getElementById("trend").innerHTML = "";
+}
+
+function fmtLatency(ms) {
+  return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`;
+}
+
+function providerPanelRows(providers, showInactive) {
+  return providers
+    .filter((p) => showInactive || p.active)
+    .map((p) => {
+      const state = p.breaker_open ? "bad" : p.active ? "good" : "off";
+      const tag = p.breaker_open ? "breaker open" : p.active ? "" : "off";
+      return `
+        <div class="prov-row">
+          <span class="prov-dot" data-state="${state}"></span>
+          <span class="prov-name">${p.name}</span>
+          ${tag ? `<span class="prov-tag prov-tag-${state}">${tag}</span>` : ""}
+        </div>`;
+    })
+    .join("");
+}
+
+async function renderStatusBand() {
+  const el = document.getElementById("statusband");
+  if (!el) return;
+  let h;
+  try {
+    h = await invoke("get_health");
+  } catch {
+    el.innerHTML = "";
+    return;
+  }
+
+  const providers = Array.isArray(h.providers) ? h.providers : [];
+  const denom = showInactiveProviders
+    ? h.configured_providers
+    : h.active_providers;
+
+  const segments = [];
+  if (h.configured_providers > 0) {
+    segments.push(
+      `<span class="stat-providers" tabindex="0">${h.active_providers}/${denom} providers</span>`
+    );
+  }
+  if (h.latency_sampled) {
+    segments.push(
+      `<span class="stat-tip" data-tip="95th percentile response time — 95% of recent requests finished faster than this.">p95 ${fmtLatency(
+        h.p95_ms
+      )}</span>`
+    );
+  }
+  if (h.cache_active) {
+    segments.push(
+      `<span class="stat-tip" data-tip="Semantic cache hit rate — share of requests served from cache instead of a provider.">cache ${Math.round(
+        h.cache_hit_rate * 100
+      )}%</span>`
+    );
+  }
+
+  if (!segments.length && h.breakers_open === 0) {
+    el.innerHTML = "";
+    return;
+  }
+
+  // Only real failures (open circuit breakers) tint the line. Providers that are
+  // simply toggled off are a deliberate config choice, not degradation.
+  const degraded = h.breakers_open > 0;
+
+  const rows = providerPanelRows(providers, showInactiveProviders);
+  const panel = rows
+    ? `<div class="prov-panel" role="tooltip">${rows}</div>`
+    : "";
+
+  const line = `<div class="statusband-line${
+    degraded ? " degraded" : ""
+  }">${segments.join(" · ")}${panel}</div>`;
+  const warn =
+    h.breakers_open > 0
+      ? `<div class="statusband-warn">⚠ ${h.breakers_open} breaker${
+          h.breakers_open === 1 ? "" : "s"
+        } open</div>`
+      : "";
+  el.innerHTML = line + warn;
 }
 
 async function runDoctor() {
@@ -575,11 +750,31 @@ function fitWindow() {
 
 getCurrentWindow().listen("run-doctor", runDoctor);
 
-document.getElementById("gear-btn")?.addEventListener("click", toggleSettings);
+const gearBtn = document.getElementById("gear-btn");
+if (gearBtn) {
+  gearBtn.innerHTML = GEAR_ICON;
+  gearBtn.addEventListener("click", toggleSettings);
+}
+
+const refreshBtn = document.getElementById("refresh-btn");
+if (refreshBtn) {
+  refreshBtn.innerHTML = REFRESH_ICON;
+  refreshBtn.addEventListener("click", async () => {
+    if (refreshBtn.classList.contains("spinning")) return;
+    refreshBtn.classList.add("spinning");
+    refreshBtn.disabled = true;
+    try {
+      await refresh();
+    } finally {
+      refreshBtn.classList.remove("spinning");
+      refreshBtn.disabled = false;
+    }
+  });
+}
+
 const helpBtn = document.getElementById("help-btn");
 if (helpBtn) {
   helpBtn.innerHTML = GITHUB_ICON;
-  helpBtn.title = "View on GitHub";
   helpBtn.addEventListener("click", () => {
     invoke("open_url", {
       url: "https://github.com/zoispag/omniroute-tray",

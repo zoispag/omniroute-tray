@@ -3,6 +3,8 @@ mod apikey;
 mod data;
 mod doctor;
 mod engine_gate;
+mod github;
+mod health;
 mod installer;
 mod lockfile;
 mod logfile;
@@ -333,6 +335,24 @@ async fn get_usage_trend(
 }
 
 #[tauri::command]
+async fn get_health(state: tauri::State<'_, AppState>) -> Result<health::HealthStatus, String> {
+    let key = state.api_key.lock().unwrap().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        health::fetch("http://127.0.0.1:20128", key.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_tray_update() -> Result<github::TrayUpdate, String> {
+    let current = env!("CARGO_PKG_VERSION").to_string();
+    tauri::async_runtime::spawn_blocking(move || github::latest_release(&current))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn run_doctor(
     app: tauri::AppHandle,
     state: tauri::State<AppState>,
@@ -547,6 +567,8 @@ pub fn run() {
             get_cost,
             get_rate_limits,
             get_usage_trend,
+            get_health,
+            get_tray_update,
             get_app_version,
             get_port,
             restart_server,
