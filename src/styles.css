@@ -143,20 +143,28 @@ body {
 }
 
 .stat-tip {
-  position: relative;
   cursor: help;
   border-bottom: 1px dotted var(--text-faint);
 }
 
+/* Anchor the tooltip to the full-width status-band line (the positioned
+   ancestor), NOT the individual segment, and center it horizontally with
+   equal left/right gaps. This keeps one consistent position (centered,
+   dropping below the underlined text) no matter which segment is hovered,
+   and it can never clip past the popover edges. */
 .stat-tip[data-tip]:hover::after {
   content: attr(data-tip);
   position: absolute;
   top: calc(100% + 6px);
   left: 0;
-  width: max-content;
-  max-width: 190px;
+  right: 0;
+  margin-left: auto;
+  margin-right: auto;
+  width: fit-content;
+  max-width: calc(100% - 24px);
   box-sizing: border-box;
   white-space: normal;
+  text-align: center;
   background: var(--text);
   color: var(--bg);
   padding: 6px 9px;
@@ -167,13 +175,6 @@ body {
   z-index: 21;
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
   pointer-events: none;
-}
-
-/* Rightmost segment: anchor the tooltip to the right so it opens leftward
-   into the popover instead of clipping past the window edge. */
-.stat-tip-right[data-tip]:hover::after {
-  left: auto;
-  right: 0;
 }
 
 .prov-panel {

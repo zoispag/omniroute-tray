@@ -257,7 +257,7 @@ function paintRateLimits() {
     .filter(([, visible]) => visible.length);
 
   if (!groups.length) {
-    section.innerHTML = `<div class="section-head"><h3>Usage</h3>${toggle}</div><p class="placeholder">All accounts hidden — enable in settings.</p>`;
+    section.innerHTML = `<div class="section-head"><h3>Usage</h3>${toggle}</div><p class="placeholder">All accounts hidden. Enable in settings.</p>`;
     wireModeToggle();
     return;
   }
@@ -649,7 +649,7 @@ async function renderTrayUpdate() {
     const u = await invoke("get_tray_update");
     if (u && u.available) {
       help.classList.add("has-update");
-      help.title = `Update available: v${u.latest} — View on GitHub`;
+      help.title = `Update available: v${u.latest}. View on GitHub`;
     }
   } catch {}
 }
@@ -711,7 +711,7 @@ async function renderStatusBand() {
   }
   if (h.latency_sampled) {
     segments.push(
-      `<span class="stat-tip" data-tip="95th percentile response time — 95% of recent requests finished faster than this.">p95 ${fmtLatency(
+      `<span class="stat-tip" data-tip="95th percentile response time: 95% of recent requests finished faster than this.">p95 ${fmtLatency(
         h.p95_ms
       )}</span>`
     );
@@ -719,10 +719,10 @@ async function renderStatusBand() {
   if (h.cache_active) {
     const saved =
       h.cache_cost_saved > 0
-        ? ` — saved $${Math.round(h.cache_cost_saved).toLocaleString()}`
+        ? `, saved $${Math.round(h.cache_cost_saved).toLocaleString()}`
         : "";
     segments.push(
-      `<span class="stat-tip stat-tip-right" data-tip="Prompt cache rate — share of requests served with cache control${saved}.">cache ${Math.round(
+      `<span class="stat-tip" data-tip="Prompt cache rate: share of requests served with cache control${saved}.">cache ${Math.round(
         h.cache_hit_rate * 100
       )}%</span>`
     );
