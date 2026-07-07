@@ -717,8 +717,12 @@ async function renderStatusBand() {
     );
   }
   if (h.cache_active) {
+    const saved =
+      h.cache_cost_saved > 0
+        ? ` — saved $${Math.round(h.cache_cost_saved).toLocaleString()}`
+        : "";
     segments.push(
-      `<span class="stat-tip" data-tip="Semantic cache hit rate — share of requests served from cache instead of a provider.">cache ${Math.round(
+      `<span class="stat-tip" data-tip="Prompt cache rate — share of requests served with cache control${saved}.">cache ${Math.round(
         h.cache_hit_rate * 100
       )}%</span>`
     );
