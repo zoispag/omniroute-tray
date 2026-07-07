@@ -41,12 +41,14 @@ Toolchain: cargo in `~/.cargo/bin` (add to PATH). Node 24.18.0 (LTS) bundled; sy
 - `data.rs` — CLI-based quota (`usage quota`) + cost (`cost --group-by model`). Dedupes quota rows.
 - `ratelimits.rs` — Claude Session/Weekly via HTTP (see data sources below). `short_label` derives the window tag (5h/7d/mo/wk) from the real key; UI infers duration-less `session` from the reset horizon.
 - `analytics.rs` — usage trend via `GET /api/usage/analytics?period=30d` → `dailyTrend[{date,cost,totalTokens}]` + `summary`. Powers the popover sparkline + Today/Yesterday/30d.
+- `health.rs` — status-strip data: aggregates `GET /api/monitoring/health` + `/api/providers` + `/api/telemetry/summary` + `/api/cache/stats` into `{active/configured providers, breakers_open, per-type provider list, p95, cache hit rate}`. Every field independently optional (partial failure still renders); empty-state flags (`cache_active`, `latency_sampled`) hide segments rather than show a misleading `0`. See verified shapes below.
+- `github.rs` — tray self-update check via GitHub Releases (`releases/latest` → `tag_name`); needs `User-Agent`, fails soft.
 - `apikey.rs` — resolves OmniRoute API key silently: `.env` → **shared `storage.sqlite`** (read-only `rusqlite`, table `api_keys`). **No Keychain by default** — the Keychain path triggered a macOS password prompt on every rebuild (ad-hoc signature changes) and was dropped; Keychain helpers remain `#[allow(dead_code)]` for a future mint case.
 - `updater.rs` — `is_newer` + staged install/atomic-swap/rollback.
 - `doctor.rs` — node/prefix/entry/version health checks.
 - `logfile.rs` — rotating capture (5 MB) of server stdout/stderr.
 - `paths.rs` — resolves bundled node, app data dir, `~/.omniroute/{.env,storage.sqlite}`.
-- `lib.rs` — Tauri setup, tray + menu, popover toggle, bootstrap thread, commands. Data commands (`get_quota`/`get_cost`/`get_rate_limits`/`get_usage_trend`) are `async` + `spawn_blocking`.
+- `lib.rs` — Tauri setup, tray + menu, popover toggle, bootstrap thread, commands. Data commands (`get_quota`/`get_cost`/`get_rate_limits`/`get_usage_trend`/`get_health`) are `async` + `spawn_blocking`; `get_tray_update` checks GitHub Releases.
 
 ## Frontend (src/)
 
@@ -61,6 +63,19 @@ Toolchain: cargo in `~/.cargo/bin` (add to PATH). Node 24.18.0 (LTS) bundled; sy
 - **Cost** (needs key): `omniroute cost --period 30d --group-by model --output json` → `[{group, requests, tokensIn, tokensOut, costUsd, costPct}]`. (NOT `model/cost/tokens`.)
 - **Claude Session/Weekly** (needs key): `GET /api/providers` → connections with `isActive` (NOT `enabled`) + `id`/`provider`/`name`; then `GET /api/usage/{connectionId}` → `{quotas: {"session (5h)": {used,total,remaining,resetAt,remainingPercentage,unlimited}, "weekly (7d)": {...}}}`. Filter out per-model windows (gemini/gpt/claude-*/sonnet/opus/haiku) — keep only session/weekly/window_*.
 - `GET /api/rate-limits` is queue/concurrency status, NOT session/weekly quota (common misdirection).
+
+### Health strip sources (verified live against v3.8.45; `health.rs`)
+
+The docs disagreed with the running instance on several shapes — these are the confirmed field paths:
+
+- **`GET /api/monitoring/health`** (NO auth): `providerSummary.{catalogCount,configuredCount,activeCount,monitoredCount}` (counts distinct provider *types*, not connections); `circuitBreakers.{open,halfOpen,degraded,closed,total}`; per-type `providerHealth.<type>.state` (`CLOSED`/`OPEN`/`HALF_OPEN`, only present for types with traffic). Full body also has `system.*`, `activeConnections`, `rateLimitStatus`.
+- **`GET /api/providers`** (needs key): flat array of per-**account** connections `{id, name, provider, isActive}` — NOT one row per provider type. `health.rs` aggregates by `provider` into types (a type is active iff any account `isActive`). On the reference instance 11 accounts collapse to 5 types.
+- **`GET /api/telemetry/summary`** (needs key): top-level aggregate `{count, avg, p50, p95, p99, errorRate, totalRequests}` — p95 is **global across providers**, NOT per-provider as the docs imply. `count==0` means no samples yet (hide the latency segment).
+- **`GET /api/cache/stats`** (needs key): FLAT `{size, maxSize, bytes, maxBytes, hits, misses, evictions, hitRate}` — NOT nested under `semanticCache` as the docs claim. `hitRate` is 0..1. `hits+misses==0` means cold cache (hide the cache segment).
+
+### Tray self-update source (`github.rs`)
+
+- **`GET https://api.github.com/repos/zoispag/omniroute-tray/releases/latest`** → `{tag_name}` (e.g. `v0.1.8`). REQUIRES a `User-Agent` header (GitHub returns 403 without it). Strip the leading `v`, compare via `updater::is_newer`. Fails soft (no update shown) on network error / rate-limit.
 
 ## Known environment quirks
 
