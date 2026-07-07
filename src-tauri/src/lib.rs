@@ -368,11 +368,7 @@ fn run_doctor(
 }
 
 #[tauri::command]
-fn apply_update(
-    app: tauri::AppHandle,
-    state: tauri::State<AppState>,
-    target: String,
-) -> Result<String, String> {
+async fn apply_update(app: tauri::AppHandle, target: String) -> Result<String, String> {
     use installer::NodeRuntime;
     use runtime::Prefix;
 
@@ -384,6 +380,7 @@ fn apply_update(
         .ok_or("bundled node not found")?
         .to_path_buf();
 
+    // Set state before the heavy work so the next 5s poll shows "Updating…".
     set_state(
         &app,
         ServerState::Updating {
@@ -391,27 +388,34 @@ fn apply_update(
         },
     );
 
-    let prefix = Prefix::new(&paths.prefix_root);
-    let node = NodeRuntime::new(&node_root);
+    // The staged install (npm + file I/O + atomic swap) must run off the main
+    // thread or it freezes the whole popover until the update finishes.
+    tauri::async_runtime::spawn_blocking(move || {
+        let prefix = Prefix::new(&paths.prefix_root);
+        let node = NodeRuntime::new(&node_root);
 
-    match updater::apply_update(&prefix, &node, &target) {
-        Ok(new_version) => {
-            let _ = node.repair_runtime(&paths.current_omniroute_entry());
-            *state.active_version.lock().unwrap() = Some(new_version.clone());
-            set_state(
-                &app,
-                ServerState::Running {
-                    version: Some(new_version.clone()),
-                },
-            );
-            Ok(new_version)
+        match updater::apply_update(&prefix, &node, &target) {
+            Ok(new_version) => {
+                let _ = node.repair_runtime(&paths.current_omniroute_entry());
+                *app.state::<AppState>().active_version.lock().unwrap() = Some(new_version.clone());
+                set_state(
+                    &app,
+                    ServerState::Running {
+                        version: Some(new_version.clone()),
+                    },
+                );
+                Ok(new_version)
+            }
+            Err(e) => {
+                // Never strand the UI in Updating: restore Running on failure.
+                let restored = prefix.active_version();
+                set_state(&app, ServerState::Running { version: restored });
+                Err(e.to_string())
+            }
         }
-        Err(e) => {
-            let restored = prefix.active_version();
-            set_state(&app, ServerState::Running { version: restored });
-            Err(e.to_string())
-        }
-    }
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -505,7 +509,8 @@ pub fn run() {
                 })
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "quit" => {
-                        stop_managed_server(app);
+                        // Cleanup runs in the RunEvent::ExitRequested handler, off the
+                        // live popover, so Quit no longer blocks the UI here.
                         app.exit(0);
                     }
                     "dashboard" => {
@@ -580,6 +585,13 @@ pub fn run() {
             get_log_path,
             apply_update
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                // Single cleanup site: stop our spawned server and clear the lockfile.
+                // Idempotent via the Mutex<Option<Supervisor>>::take() inside.
+                stop_managed_server(app_handle);
+            }
+        });
 }
