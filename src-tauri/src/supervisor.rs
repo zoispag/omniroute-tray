@@ -9,7 +9,6 @@ use crate::lockfile::{LockRecord, Lockfile};
 
 const DEFAULT_PORT: u16 = 20128;
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
-const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Error)]
 pub enum SupervisorError {
@@ -78,24 +77,17 @@ extern "C" {
 }
 
 #[cfg(unix)]
-#[allow(dead_code)]
 const SIGTERM: i32 = 15;
-#[cfg(unix)]
-#[allow(dead_code)]
-const SIGKILL: i32 = 9;
 
 #[cfg(unix)]
-#[allow(dead_code)]
-fn kill_process_group(pid: u32) {
-    let group = -(pid as i32);
+fn signal_group_term(pid: u32) {
     unsafe {
-        libc_kill(group, SIGTERM);
-    }
-    std::thread::sleep(Duration::from_millis(300));
-    unsafe {
-        libc_kill(group, SIGKILL);
+        libc_kill(-(pid as i32), SIGTERM);
     }
 }
+
+#[cfg(not(unix))]
+fn signal_group_term(_pid: u32) {}
 
 #[cfg(not(unix))]
 #[allow(dead_code)]
@@ -231,50 +223,36 @@ impl Supervisor {
     }
 
     pub fn stop(&mut self) -> Result<(), SupervisorError> {
-        if let Some(mut child) = self.child.take() {
+        // This runs on the main/UI thread during quit, so it MUST NOT block.
+        // Liveness is tracked over HTTP, not this launcher PID, and the OS reaps
+        // our children on exit — so there is no reason to wait() here (a wait on
+        // omniroute's double-forked, detached launcher can block forever).
+        if let Some(child) = self.child.take() {
+            // Ask omniroute to stop the detached server via its pid-file.
+            // Fire-and-forget: spawn and never wait; null all stdio so no
+            // inherited descriptor keeps a handle alive.
             let mut stop_cmd = Command::new(&self.node_bin);
             stop_cmd
                 .arg(&self.omniroute_entry)
                 .arg("stop")
+                .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
             if let Some(node_dir) = self.node_bin.parent() {
                 let existing = std::env::var("PATH").unwrap_or_default();
                 stop_cmd.env("PATH", format!("{}:{existing}", node_dir.display()));
             }
-            // Bounded wait: `omniroute stop` normally returns quickly, but if it
-            // hangs it would wedge process exit. Fall back to a process-group kill
-            // of our own launcher child so shutdown always makes progress.
-            match stop_cmd.spawn() {
-                Ok(mut stop_child) => {
-                    if !wait_with_timeout(&mut stop_child, STOP_TIMEOUT) {
-                        let _ = stop_child.kill();
-                        kill_process_group(child.id());
-                    }
-                }
-                Err(_) => kill_process_group(child.id()),
-            }
-            let _ = child.wait();
+            let _ = stop_cmd.spawn();
+
+            // Best-effort backstop: SIGTERM the launcher's process group. No sleep,
+            // no SIGKILL — both would block/pointlessly delay the main thread.
+            signal_group_term(child.id());
+
+            drop(child);
         }
-        // The lockfile MUST be cleared even if the stop above was messy.
+        // ALWAYS clear the lockfile, synchronously, last. Idempotent.
         self.lockfile.clear()?;
         Ok(())
-    }
-}
-
-fn wait_with_timeout(child: &mut Child, timeout: Duration) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return true,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    return false;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(_) => return false,
-        }
     }
 }
 
