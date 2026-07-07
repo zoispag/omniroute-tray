@@ -155,6 +155,7 @@ body {
   left: 0;
   width: max-content;
   max-width: 190px;
+  box-sizing: border-box;
   white-space: normal;
   background: var(--text);
   color: var(--bg);
@@ -166,6 +167,13 @@ body {
   z-index: 21;
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
   pointer-events: none;
+}
+
+/* Rightmost segment: anchor the tooltip to the right so it opens leftward
+   into the popover instead of clipping past the window edge. */
+.stat-tip-right[data-tip]:hover::after {
+  left: auto;
+  right: 0;
 }
 
 .prov-panel {

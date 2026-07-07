@@ -2,8 +2,7 @@
 //! - `GET /api/monitoring/health` (NO auth): `providerSummary.{activeCount,configuredCount}`, `circuitBreakers.{open,halfOpen}`, `providerHealth.<type>.state`.
 //! - `GET /api/providers` (Bearer): flat array of per-*account* connections `{provider, isActive}`; aggregated here by provider type.
 //! - `GET /api/telemetry/summary` (Bearer): top-level aggregate `p95`, `count`, `errorRate`.
-//! - `GET /api/cache/stats` (Bearer): `hitRate` (0..1), `hits`, `misses`.
-//!   (Docs claimed nested `semanticCache.hitRate`; the real shape is flat — confirmed by live probe.)
+//! - `GET /api/cache` (no auth): `promptCache.{totalRequests,requestsWithCacheControl,estimatedCostSaved}` — the provider-side prompt cache (the active one). The sibling `semanticCache` is opt-in and usually cold, so we deliberately ignore it. (`/api/cache/stats` only exposes the cold semantic cache — misleading.)
 
 use serde::Serialize;
 use serde_json::Value;
@@ -31,8 +30,11 @@ pub struct HealthStatus {
     pub providers: Vec<ProviderType>,
     pub p95_ms: f64,
     pub error_rate: f64,
+    /// Prompt-cache rate (0..1): share of requests served with cache control.
     pub cache_hit_rate: f64,
-    /// True when the cache has seen at least one lookup (hits + misses > 0).
+    /// Estimated USD saved by the prompt cache over the tracked window.
+    pub cache_cost_saved: f64,
+    /// True when the prompt cache has processed at least one request.
     pub cache_active: bool,
     /// True when telemetry has at least one sampled request.
     pub latency_sampled: bool,
@@ -41,22 +43,22 @@ pub struct HealthStatus {
 pub fn fetch(base_url: &str, api_key: Option<&str>) -> HealthStatus {
     let mut status = HealthStatus::default();
 
-    // Health endpoint needs no auth; always attempt it.
+    // Health and cache endpoints need no auth; always attempt them.
     let mut breaker_states: BTreeMap<String, bool> = BTreeMap::new();
     if let Some(body) = get(&format!("{base_url}/api/monitoring/health"), None) {
         breaker_states = apply_health(&mut status, &body);
     }
+    if let Some(body) = get(&format!("{base_url}/api/cache"), api_key) {
+        apply_cache(&mut status, &body);
+    }
 
-    // Telemetry, cache, and the provider list require a Bearer key. Skip cleanly if unavailable.
+    // Telemetry and the provider list require a Bearer key. Skip cleanly if unavailable.
     if let Some(key) = api_key {
         if let Some(body) = get(&format!("{base_url}/api/providers"), Some(key)) {
             apply_providers(&mut status, &body, &breaker_states);
         }
         if let Some(body) = get(&format!("{base_url}/api/telemetry/summary"), Some(key)) {
             apply_telemetry(&mut status, &body);
-        }
-        if let Some(body) = get(&format!("{base_url}/api/cache/stats"), Some(key)) {
-            apply_cache(&mut status, &body);
         }
     }
 
@@ -155,11 +157,27 @@ fn apply_telemetry(status: &mut HealthStatus, v: &Value) {
 }
 
 fn apply_cache(status: &mut HealthStatus, v: &Value) {
-    let hits = v.get("hits").and_then(Value::as_f64).unwrap_or(0.0);
-    let misses = v.get("misses").and_then(Value::as_f64).unwrap_or(0.0);
-    status.cache_active = (hits + misses) > 0.0;
+    // Use the provider-side prompt cache (the active, high-value one), NOT the
+    // semanticCache block — semantic caching is opt-in and usually cold, which
+    // made the old /api/cache/stats reading report a permanent, misleading 0%.
+    let Some(pc) = v.get("promptCache") else {
+        return;
+    };
+    let total = pc
+        .get("totalRequests")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    status.cache_active = total > 0.0;
     if status.cache_active {
-        status.cache_hit_rate = v.get("hitRate").and_then(Value::as_f64).unwrap_or(0.0);
+        let cached = pc
+            .get("requestsWithCacheControl")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        status.cache_hit_rate = cached / total;
+        status.cache_cost_saved = pc
+            .get("estimatedCostSaved")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
     }
 }
 
@@ -184,11 +202,17 @@ mod tests {
       "totalRequests": 1, "avgLatencyMs": 6176, "errorRate": 0
     }"#;
 
-    const CACHE_EMPTY: &str =
-        r#"{"size": 0, "maxSize": 50, "hits": 0, "misses": 0, "evictions": 0, "hitRate": 0}"#;
+    // /api/cache shape: cold prompt cache (no requests) alongside the semantic cache.
+    const CACHE_COLD: &str = r#"{
+      "semanticCache": {"hits": 0, "misses": 0, "hitRate": "0.0"},
+      "promptCache": {"totalRequests": 0, "requestsWithCacheControl": 0, "estimatedCostSaved": 0}
+    }"#;
 
-    const CACHE_WARM: &str =
-        r#"{"size": 12, "maxSize": 50, "hits": 34, "misses": 66, "evictions": 0, "hitRate": 0.34}"#;
+    // Active prompt cache: 986/1000 requests cached, $57.38 saved.
+    const CACHE_WARM: &str = r#"{
+      "semanticCache": {"hits": 0, "misses": 0, "hitRate": "0.0"},
+      "promptCache": {"totalRequests": 1000, "requestsWithCacheControl": 986, "estimatedCostSaved": 57.38}
+    }"#;
 
     // Synthetic fixture mirroring the /api/providers shape: multiple accounts per
     // provider type, so 6 rows collapse to 4 types of which 2 have an active account.
@@ -243,19 +267,34 @@ mod tests {
     }
 
     #[test]
-    fn empty_cache_is_inactive() {
+    fn cold_prompt_cache_is_inactive() {
         let mut s = HealthStatus::default();
-        apply_cache(&mut s, &parse(CACHE_EMPTY));
+        apply_cache(&mut s, &parse(CACHE_COLD));
         assert!(!s.cache_active);
         assert_eq!(s.cache_hit_rate, 0.0);
+        assert_eq!(s.cache_cost_saved, 0.0);
     }
 
     #[test]
-    fn warm_cache_reports_hit_rate() {
+    fn warm_prompt_cache_reports_rate_and_savings() {
         let mut s = HealthStatus::default();
         apply_cache(&mut s, &parse(CACHE_WARM));
         assert!(s.cache_active);
-        assert_eq!(s.cache_hit_rate, 0.34);
+        assert_eq!(s.cache_hit_rate, 0.986);
+        assert_eq!(s.cache_cost_saved, 57.38);
+    }
+
+    #[test]
+    fn cache_ignores_semantic_block() {
+        // Semantic cache warm but prompt cache empty -> still inactive (we only read promptCache).
+        let mut s = HealthStatus::default();
+        apply_cache(
+            &mut s,
+            &parse(
+                r#"{"semanticCache":{"hits":50,"misses":10,"hitRate":"0.83"},"promptCache":{"totalRequests":0}}"#,
+            ),
+        );
+        assert!(!s.cache_active);
     }
 
     #[test]
