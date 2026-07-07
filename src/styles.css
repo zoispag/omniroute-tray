@@ -472,8 +472,72 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-.cost-row span:first-child {
+.cost-model {
   color: var(--text);
+}
+
+.cost-bar {
+  height: 6px;
+  border-radius: 99px;
+  background: var(--accent);
+  margin: 2px 0 7px;
+  overflow: hidden;
+  position: relative;
+  cursor: help;
+  min-width: 6px;
+}
+
+.cost-in {
+  display: block;
+  height: 100%;
+  background: var(--text);
+  border-radius: 99px 0 0 99px;
+}
+
+.cost-bar[data-tip]:hover::after {
+  content: attr(data-tip);
+  position: absolute;
+  top: calc(100% + 5px);
+  left: 0;
+  width: max-content;
+  background: var(--text);
+  color: var(--bg);
+  padding: 5px 9px;
+  border-radius: 7px;
+  font-size: 11px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  z-index: 21;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
+  pointer-events: none;
+}
+
+.cost-legend {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+.cost-swatch {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+}
+
+.cost-swatch-in {
+  background: var(--text);
+}
+
+.cost-swatch-out {
+  background: var(--accent);
+}
+
+.cost-legend .cost-swatch:not(:first-child) {
+  margin-left: 6px;
 }
 
 .connect {

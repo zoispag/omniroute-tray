@@ -2537,7 +2537,7 @@ dependencies = [
 
 [[package]]
 name = "omniroute-tray"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "keyring",
  "log",

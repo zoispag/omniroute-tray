@@ -412,19 +412,38 @@ async function renderCost() {
     .slice(0, 4)
     .map((r) => {
       const share = total > 0 ? ((r.cost ?? 0) / total) * 100 : 0;
-      return `<div class="cost-row"><span>${r.model}</span><span>${share.toFixed(1)}%</span></div>`;
+      const tin = r.tokens_in ?? 0;
+      const tout = r.tokens_out ?? 0;
+      const sum = tin + tout;
+      const inPct = sum > 0 ? (tin / sum) * 100 : 0;
+      const tip = `${compactTokens(tin)} in · ${compactTokens(tout)} out`;
+      return `
+        <div class="cost-row">
+          <span class="cost-model">${r.model}</span>
+          <span class="cost-share">${share.toFixed(1)}%</span>
+        </div>
+        <div class="cost-bar" style="width:${Math.max(share, 3)}%" data-tip="${tip}">
+          <span class="cost-in" style="width:${inPct}%"></span>
+        </div>`;
     })
     .join("");
   section.innerHTML = `
     <h3>Cost (30d)</h3>
     <div class="cost-total">$${total.toFixed(2)} · ${formatTokens(totalTokens)}</div>
-    ${top}`;
+    ${top}
+    <div class="cost-legend"><span class="cost-swatch cost-swatch-in"></span>input<span class="cost-swatch cost-swatch-out"></span>output</div>`;
 }
 
 function formatTokens(n) {
   if (n >= 1e6) return `${(n / 1e6).toFixed(0)}M tokens`;
   if (n >= 1e3) return `${(n / 1e3).toFixed(0)}K tokens`;
   return `${n} tokens`;
+}
+
+function compactTokens(n) {
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(0)}K`;
+  return `${n}`;
 }
 
 function money(n) {
