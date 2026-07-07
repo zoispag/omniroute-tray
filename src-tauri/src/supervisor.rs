@@ -9,6 +9,7 @@ use crate::lockfile::{LockRecord, Lockfile};
 
 const DEFAULT_PORT: u16 = 20128;
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Error)]
 pub enum SupervisorError {
@@ -241,11 +242,39 @@ impl Supervisor {
                 let existing = std::env::var("PATH").unwrap_or_default();
                 stop_cmd.env("PATH", format!("{}:{existing}", node_dir.display()));
             }
-            let _ = stop_cmd.status();
+            // Bounded wait: `omniroute stop` normally returns quickly, but if it
+            // hangs it would wedge process exit. Fall back to a process-group kill
+            // of our own launcher child so shutdown always makes progress.
+            match stop_cmd.spawn() {
+                Ok(mut stop_child) => {
+                    if !wait_with_timeout(&mut stop_child, STOP_TIMEOUT) {
+                        let _ = stop_child.kill();
+                        kill_process_group(child.id());
+                    }
+                }
+                Err(_) => kill_process_group(child.id()),
+            }
             let _ = child.wait();
         }
+        // The lockfile MUST be cleared even if the stop above was messy.
         self.lockfile.clear()?;
         Ok(())
+    }
+}
+
+fn wait_with_timeout(child: &mut Child, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return false,
+        }
     }
 }
 
@@ -321,6 +350,20 @@ mod tests {
             })
             .unwrap();
         assert!(sup.child.is_none());
+        sup.stop().unwrap();
+        assert!(sup.lockfile.read().unwrap().is_none());
+    }
+
+    #[test]
+    fn stop_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sup = Supervisor::new(
+            PathBuf::from("/nonexistent/node"),
+            PathBuf::from("/nonexistent/omniroute.mjs"),
+            dir.path().to_path_buf(),
+            "mine".into(),
+        );
+        sup.stop().unwrap();
         sup.stop().unwrap();
         assert!(sup.lockfile.read().unwrap().is_none());
     }
