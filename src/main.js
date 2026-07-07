@@ -722,7 +722,7 @@ async function renderStatusBand() {
         ? ` — saved $${Math.round(h.cache_cost_saved).toLocaleString()}`
         : "";
     segments.push(
-      `<span class="stat-tip" data-tip="Prompt cache rate — share of requests served with cache control${saved}.">cache ${Math.round(
+      `<span class="stat-tip stat-tip-right" data-tip="Prompt cache rate — share of requests served with cache control${saved}.">cache ${Math.round(
         h.cache_hit_rate * 100
       )}%</span>`
     );
