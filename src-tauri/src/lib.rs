@@ -293,12 +293,12 @@ async fn get_quota(state: tauri::State<'_, AppState>) -> Result<Vec<QuotaRow>, S
 }
 
 #[tauri::command]
-async fn get_cost(state: tauri::State<'_, AppState>) -> Result<CostResult, String> {
+async fn get_cost(state: tauri::State<'_, AppState>, range: String) -> Result<CostResult, String> {
     let client = state.data.lock().unwrap().clone();
     let Some(client) = client else {
         return Ok(CostResult::unavailable());
     };
-    tauri::async_runtime::spawn_blocking(move || client.cost_by_model("30d"))
+    tauri::async_runtime::spawn_blocking(move || client.cost_report(&range))
         .await
         .map_err(|e| e.to_string())
 }
