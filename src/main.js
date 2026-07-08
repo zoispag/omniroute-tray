@@ -23,6 +23,14 @@ let showInactiveProviders =
   localStorage.getItem("showInactiveProviders") === "true";
 let costShowTokens = localStorage.getItem("costMode") === "tokens";
 let costCache = null;
+let costRange = localStorage.getItem("costRange") || "30d";
+const COST_RANGES = [
+  ["1d", "1D"],
+  ["7d", "7D"],
+  ["30d", "30D"],
+  ["yesterday", "Yesterday"],
+  ["today", "Today"],
+];
 
 const SECTION_LABELS = [
   ["health", "Provider health"],
@@ -392,49 +400,81 @@ function formatResetAbsolute(value) {
 
 
 async function renderCost() {
-  const result = await invoke("get_cost");
+  const requestedRange = costRange;
+  const result = await invoke("get_cost", { range: requestedRange });
+  if (requestedRange !== costRange) return; // a newer range was picked meanwhile
   costCache = result;
   paintCost();
 }
 
+function costSkeleton() {
+  const row = `<div class="cost-row"><span class="skel skel-cost-label"></span><span class="skel skel-cost-value"></span></div>`;
+  return `<div class="skel skel-cost-total"></div>${row}${row}${row}${row}`;
+}
+
 function paintCost() {
   const section = document.getElementById("cost");
-  if (!section || !costCache) return;
   const result = costCache;
-  if (result.status === "needs-api-key") {
-    section.innerHTML = `<a class="connect" href="http://127.0.0.1:20128" target="_blank">Connect API key →</a>`;
+  if (!section || (result && result.status === "unavailable")) {
+    if (section) section.innerHTML = "";
     return;
   }
-  if (result.status !== "available" || !result.rows?.length) {
-    section.innerHTML = "";
-    return;
-  }
-  const rows = result.rows;
-  const total = rows.reduce((s, r) => s + (r.cost ?? 0), 0);
-  const totalTokens = rows.reduce(
-    (s, r) => s + (r.tokens_in ?? 0) + (r.tokens_out ?? 0),
-    0
-  );
+
+  const rangeSelect = `<select id="cost-range" class="mode-select">${COST_RANGES.map(
+    ([value, label]) =>
+      `<option value="${value}"${value === costRange ? " selected" : ""}>${label}</option>`
+  ).join("")}</select>`;
+
+  // Always rendered (not gated on rows) so the range select doesn't shift
+  // position as this button appears/disappears across loading/empty states.
   const toggle = `<button id="cost-toggle" class="mode-toggle">${
     costShowTokens ? "in/out" : "%"
   }</button>`;
-  const top = rows
-    .slice()
-    .sort((a, b) => (b.cost ?? 0) - (a.cost ?? 0))
-    .slice(0, 4)
-    .map((r) => {
-      const value = costShowTokens
-        ? `${compactTokens(r.tokens_in ?? 0)} in · ${compactTokens(
-            r.tokens_out ?? 0
-          )} out`
-        : `${(total > 0 ? ((r.cost ?? 0) / total) * 100 : 0).toFixed(1)}%`;
-      return `<div class="cost-row"><span class="cost-model">${r.model}</span><span class="cost-value">${value}</span></div>`;
-    })
-    .join("");
+
+  let body;
+  if (!result) {
+    body = costSkeleton();
+  } else if (result.status === "needs-api-key") {
+    body = `<a class="connect" href="http://127.0.0.1:20128" target="_blank">Connect API key →</a>`;
+  } else if (!result.rows?.length) {
+    body = `<div class="cost-empty">No spend in this range.</div>`;
+  } else {
+    const rows = result.rows;
+    const total = rows.reduce((s, r) => s + (r.cost ?? 0), 0);
+    const totalTokens = rows.reduce(
+      (s, r) => s + (r.tokens_in ?? 0) + (r.tokens_out ?? 0),
+      0
+    );
+    const top = rows
+      .slice()
+      .sort((a, b) => (b.cost ?? 0) - (a.cost ?? 0))
+      .slice(0, 4)
+      .map((r) => {
+        const value = costShowTokens
+          ? `${compactTokens(r.tokens_in ?? 0)} in · ${compactTokens(
+              r.tokens_out ?? 0
+            )} out`
+          : `${(total > 0 ? ((r.cost ?? 0) / total) * 100 : 0).toFixed(1)}%`;
+        return `<div class="cost-row"><span class="cost-model" data-tip="${r.model}">${r.model}</span><span class="cost-value">${value}</span></div>`;
+      })
+      .join("");
+    body = `<div class="cost-total">$${total.toFixed(2)} · ${formatTokens(totalTokens)}</div>${top}`;
+  }
+
   section.innerHTML = `
-    <div class="section-head"><h3>Cost (30d)</h3>${toggle}</div>
-    <div class="cost-total">$${total.toFixed(2)} · ${formatTokens(totalTokens)}</div>
-    ${top}`;
+    <div class="section-head"><h3>Cost</h3><div class="cost-controls">${rangeSelect}${toggle}</div></div>
+    ${body}`;
+
+  const rangeSel = document.getElementById("cost-range");
+  if (rangeSel) {
+    rangeSel.onchange = () => {
+      costRange = rangeSel.value;
+      localStorage.setItem("costRange", costRange);
+      costCache = null;
+      paintCost();
+      renderCost();
+    };
+  }
 
   const btn = document.getElementById("cost-toggle");
   if (btn) {

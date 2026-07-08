@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
 
+use chrono::{Duration, Local, NaiveDate};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -96,7 +97,32 @@ impl DataClient {
     }
 
     pub fn cost_by_model(&self, period: &str) -> CostResult {
-        match self.run_json(&["cost", "--period", period, "--group-by", "model"]) {
+        self.run_cost(&["cost", "--period", period, "--group-by", "model"])
+    }
+
+    pub fn cost_by_range(&self, since: &str, until: Option<&str>) -> CostResult {
+        let mut args: Vec<&str> = vec!["cost", "--since", since];
+        if let Some(until) = until {
+            args.push("--until");
+            args.push(until);
+        }
+        args.push("--group-by");
+        args.push("model");
+        self.run_cost(&args)
+    }
+
+    /// Resolves a UI-facing range identifier ("1d"/"7d"/"30d"/"today"/"yesterday")
+    /// into the appropriate `omniroute cost` invocation. Unknown values fall back
+    /// to the historical 30d default.
+    pub fn cost_report(&self, range: &str) -> CostResult {
+        match resolve_cost_query(range, Local::now().date_naive()) {
+            CostQuery::Period(period) => self.cost_by_model(period),
+            CostQuery::Range { since, until } => self.cost_by_range(&since, until.as_deref()),
+        }
+    }
+
+    fn run_cost(&self, args: &[&str]) -> CostResult {
+        match self.run_json(args) {
             Ok(raw) => match parse_cost(&raw) {
                 Ok(rows) => CostResult::available(rows),
                 Err(_) => CostResult::unavailable(),
@@ -105,6 +131,45 @@ impl DataClient {
             Err(_) => CostResult::unavailable(),
         }
     }
+}
+
+/// Intermediate representation of how to query `omniroute cost` for a given
+/// UI range selection, kept separate from `DataClient` so it can be unit
+/// tested without a "today" that changes every day.
+#[derive(Debug, Clone, PartialEq)]
+enum CostQuery {
+    Period(&'static str),
+    Range {
+        since: String,
+        until: Option<String>,
+    },
+}
+
+fn resolve_cost_query(range: &str, today: NaiveDate) -> CostQuery {
+    match range {
+        "1d" => CostQuery::Period("1d"),
+        "7d" => CostQuery::Period("7d"),
+        "90d" => CostQuery::Period("90d"),
+        "ytd" => CostQuery::Period("ytd"),
+        "all" => CostQuery::Period("all"),
+        "today" => CostQuery::Range {
+            since: format_date(today),
+            until: None,
+        },
+        "yesterday" => {
+            let yesterday = today - Duration::days(1);
+            CostQuery::Range {
+                since: format_date(yesterday),
+                until: Some(format_date(today)),
+            }
+        }
+        // "30d" and any unrecognized value fall back to the original default.
+        _ => CostQuery::Period("30d"),
+    }
+}
+
+fn format_date(date: NaiveDate) -> String {
+    date.format("%Y-%m-%d").to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -263,5 +328,60 @@ mod tests {
         ));
         assert!(is_auth_error("missing api key"));
         assert!(!is_auth_error("connection refused"));
+    }
+
+    fn fixed_today() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 3, 15).unwrap()
+    }
+
+    #[test]
+    fn resolves_period_ranges_passthrough() {
+        let today = fixed_today();
+        assert_eq!(resolve_cost_query("1d", today), CostQuery::Period("1d"));
+        assert_eq!(resolve_cost_query("7d", today), CostQuery::Period("7d"));
+        assert_eq!(resolve_cost_query("30d", today), CostQuery::Period("30d"));
+    }
+
+    #[test]
+    fn resolves_today_to_since_only() {
+        let today = fixed_today();
+        assert_eq!(
+            resolve_cost_query("today", today),
+            CostQuery::Range {
+                since: "2026-03-15".to_string(),
+                until: None,
+            }
+        );
+    }
+
+    #[test]
+    fn resolves_yesterday_to_since_until_pair() {
+        let today = fixed_today();
+        assert_eq!(
+            resolve_cost_query("yesterday", today),
+            CostQuery::Range {
+                since: "2026-03-14".to_string(),
+                until: Some("2026-03-15".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn resolves_yesterday_across_month_boundary() {
+        let today = NaiveDate::from_ymd_opt(2026, 3, 1).unwrap();
+        assert_eq!(
+            resolve_cost_query("yesterday", today),
+            CostQuery::Range {
+                since: "2026-02-28".to_string(),
+                until: Some("2026-03-01".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_range_falls_back_to_thirty_days() {
+        let today = fixed_today();
+        assert_eq!(resolve_cost_query("", today), CostQuery::Period("30d"));
+        assert_eq!(resolve_cost_query("bogus", today), CostQuery::Period("30d"));
     }
 }
