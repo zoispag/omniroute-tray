@@ -236,6 +236,36 @@ fn check_for_update(app: &tauri::AppHandle, current: &str) {
     }
 }
 
+const UPDATE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Periodically re-check the npm registry for a newer omniroute.
+///
+/// `check_for_update` otherwise only runs once at the end of `bootstrap()`, so
+/// a release published while the app sits in `Running` was never noticed until
+/// the next app restart (which is why an adopted instance — fresh launch, fresh
+/// bootstrap — showed the update while a long-running one did not).
+///
+/// Spawned exactly once at app setup, NOT inside `bootstrap()`, which re-runs
+/// on every "Restart Server" and would leak a duplicate loop each time.
+fn schedule_update_checks(app: tauri::AppHandle) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(UPDATE_CHECK_INTERVAL);
+        let app_state = app.state::<AppState>();
+        // Only nudge steady states; never clobber Starting/Updating/Error.
+        let can_check = matches!(
+            *app_state.server.lock().unwrap(),
+            ServerState::Running { .. } | ServerState::UpdateAvailable { .. }
+        );
+        if !can_check {
+            continue;
+        }
+        let current = app_state.active_version.lock().unwrap().clone();
+        if let Some(current) = current {
+            check_for_update(&app, &current);
+        }
+    });
+}
+
 fn toggle_popover(app: &tauri::AppHandle) {
     let Some(window) = app.get_webview_window(POPOVER_LABEL) else {
         return;
@@ -549,6 +579,7 @@ pub fn run() {
 
             let handle = app.handle().clone();
             std::thread::spawn(move || bootstrap(handle));
+            schedule_update_checks(app.handle().clone());
 
             Ok(())
         })
