@@ -216,6 +216,10 @@ fn monitor_health(app: tauri::AppHandle, version: String) {
                         version: Some(version.clone()),
                     },
                 );
+                // bootstrap() only runs check_for_update when wait_ready succeeds
+                // within 20s. A slow cold start lands in Error, recovers here, and
+                // would otherwise never learn about a pending update.
+                check_for_update(&app, &version);
             }
             _ => {}
         }
