@@ -53,6 +53,20 @@ pub fn server_healthy(port: u16) -> bool {
     }
 }
 
+// Liveness probe for the health monitor: any HTTP reply means the server is
+// responding. `server_healthy` is unsuitable there — it demands a literal
+// "healthy" status, so a degraded report (open circuit breaker) or a reply
+// slower than its timeout while the event loop grinds through /api/usage
+// calls would be misread as "server down".
+pub fn server_responding(port: u16) -> bool {
+    let url = format!("http://127.0.0.1:{port}/api/monitoring/health");
+    match ureq::get(&url).timeout(Duration::from_secs(2)).call() {
+        Ok(_) => true,
+        Err(ureq::Error::Status(_, _)) => true,
+        Err(_) => false,
+    }
+}
+
 pub fn port_alive(port: u16) -> bool {
     let addr = format!("127.0.0.1:{port}");
     match addr.to_socket_addrs() {

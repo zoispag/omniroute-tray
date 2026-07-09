@@ -194,34 +194,49 @@ fn bootstrap(app: tauri::AppHandle) {
     monitor_health(app, version);
 }
 
+const HEALTH_FAILURES_BEFORE_ERROR: u32 = 3;
+
 fn monitor_health(app: tauri::AppHandle, version: String) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_secs(5));
-        let healthy = supervisor::server_healthy(20128);
-        let app_state = app.state::<AppState>();
-        let current = app_state.server.lock().unwrap().clone();
-        match (&current, healthy) {
-            (ServerState::Running { .. } | ServerState::UpdateAvailable { .. }, false) => {
-                set_state(
-                    &app,
-                    ServerState::Error {
-                        reason: "OmniRoute server is not responding on :20128".into(),
-                    },
-                );
+    std::thread::spawn(move || {
+        let mut consecutive_failures: u32 = 0;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let responding = supervisor::server_responding(20128);
+            if responding {
+                consecutive_failures = 0;
+            } else {
+                consecutive_failures += 1;
             }
-            (ServerState::Error { .. } | ServerState::Stopped, true) => {
-                set_state(
-                    &app,
-                    ServerState::Running {
-                        version: Some(version.clone()),
-                    },
-                );
-                // bootstrap() only runs check_for_update when wait_ready succeeds
-                // within 20s. A slow cold start lands in Error, recovers here, and
-                // would otherwise never learn about a pending update.
-                check_for_update(&app, &version);
+            let app_state = app.state::<AppState>();
+            let current = app_state.server.lock().unwrap().clone();
+            match (&current, responding) {
+                // Debounced: a single missed probe is routinely just the server's
+                // event loop being busy (e.g. the settings pane fetching per-account
+                // usage); only sustained silence means it is actually down.
+                (ServerState::Running { .. } | ServerState::UpdateAvailable { .. }, false)
+                    if consecutive_failures >= HEALTH_FAILURES_BEFORE_ERROR =>
+                {
+                    set_state(
+                        &app,
+                        ServerState::Error {
+                            reason: "OmniRoute server is not responding on :20128".into(),
+                        },
+                    );
+                }
+                (ServerState::Error { .. } | ServerState::Stopped, true) => {
+                    set_state(
+                        &app,
+                        ServerState::Running {
+                            version: Some(version.clone()),
+                        },
+                    );
+                    // bootstrap() only runs check_for_update when wait_ready succeeds
+                    // within 20s. A slow cold start lands in Error, recovers here, and
+                    // would otherwise never learn about a pending update.
+                    check_for_update(&app, &version);
+                }
+                _ => {}
             }
-            _ => {}
         }
     });
 }
