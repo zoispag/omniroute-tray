@@ -37,6 +37,8 @@ struct AppState {
     api_key: Mutex<Option<String>>,
     supervisor: Mutex<Option<supervisor::Supervisor>>,
     pin_open: std::sync::atomic::AtomicBool,
+    /// Warmed by `schedule_quota_refresh` so `get_rate_limits` serves instantly on popover-open.
+    rate_limit_cache: Mutex<Option<Vec<ratelimits::AccountLimits>>>,
 }
 
 impl AppState {
@@ -48,6 +50,7 @@ impl AppState {
             api_key: Mutex::new(None),
             supervisor: Mutex::new(None),
             pin_open: std::sync::atomic::AtomicBool::new(false),
+            rate_limit_cache: Mutex::new(None),
         }
     }
 }
@@ -285,6 +288,37 @@ fn schedule_update_checks(app: tauri::AppHandle) {
     });
 }
 
+const QUOTA_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Periodically refresh Claude session/weekly quota in the background so the
+/// popover paints fresh numbers instantly on open, and so quota stays current
+/// even while the popover is closed (the 5s foreground loop only runs when the
+/// UI is alive). Mirrors `schedule_update_checks`: spawned once at setup, gated
+/// on `Running`, and pushes results to the frontend via an event.
+fn schedule_quota_refresh(app: tauri::AppHandle) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(QUOTA_REFRESH_INTERVAL);
+        let app_state = app.state::<AppState>();
+        let running = matches!(
+            *app_state.server.lock().unwrap(),
+            ServerState::Running { .. }
+        );
+        if !running {
+            continue;
+        }
+        let Some(key) = app_state.api_key.lock().unwrap().clone() else {
+            continue;
+        };
+        let Ok(limits) = ratelimits::fetch("http://127.0.0.1:20128", &key) else {
+            continue;
+        };
+        *app_state.rate_limit_cache.lock().unwrap() = Some(limits.clone());
+        if let Some(window) = app.get_webview_window(POPOVER_LABEL) {
+            let _ = window.emit("quota-refreshed", limits);
+        }
+    });
+}
+
 fn toggle_popover(app: &tauri::AppHandle) {
     let Some(window) = app.get_webview_window(POPOVER_LABEL) else {
         return;
@@ -360,10 +394,21 @@ async fn get_rate_limits(
     let Some(key) = key else {
         return Ok(Vec::new());
     };
-    tauri::async_runtime::spawn_blocking(move || ratelimits::fetch("http://127.0.0.1:20128", &key))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())
+    let fetched = tauri::async_runtime::spawn_blocking(move || {
+        ratelimits::fetch("http://127.0.0.1:20128", &key)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    match fetched {
+        Ok(limits) => {
+            *state.rate_limit_cache.lock().unwrap() = Some(limits.clone());
+            Ok(limits)
+        }
+        Err(e) => match state.rate_limit_cache.lock().unwrap().clone() {
+            Some(cached) => Ok(cached),
+            None => Err(e.to_string()),
+        },
+    }
 }
 
 #[tauri::command]
@@ -599,6 +644,7 @@ pub fn run() {
             let handle = app.handle().clone();
             std::thread::spawn(move || bootstrap(handle));
             schedule_update_checks(app.handle().clone());
+            schedule_quota_refresh(app.handle().clone());
 
             Ok(())
         })
