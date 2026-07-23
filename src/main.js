@@ -825,6 +825,11 @@ function fitWindow() {
 
 getCurrentWindow().listen("run-doctor", runDoctor);
 
+getCurrentWindow().listen("quota-refreshed", (event) => {
+  if (Array.isArray(event.payload)) rateLimitCache = event.payload;
+  if (!inSettings) paintRateLimits();
+});
+
 const gearBtn = document.getElementById("gear-btn");
 if (gearBtn) {
   gearBtn.innerHTML = GEAR_ICON;
