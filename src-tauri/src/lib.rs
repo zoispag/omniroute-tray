@@ -37,7 +37,9 @@ struct AppState {
     api_key: Mutex<Option<String>>,
     supervisor: Mutex<Option<supervisor::Supervisor>>,
     pin_open: std::sync::atomic::AtomicBool,
-    /// Warmed by `schedule_quota_refresh` so `get_rate_limits` serves instantly on popover-open.
+    /// Last successful quota fetch. Warmed by `schedule_quota_refresh` and used by
+    /// `get_rate_limits` as a fallback when a live fetch fails, so the UI keeps the
+    /// last-known values instead of blanking.
     rate_limit_cache: Mutex<Option<Vec<ratelimits::AccountLimits>>>,
 }
 
@@ -290,20 +292,20 @@ fn schedule_update_checks(app: tauri::AppHandle) {
 
 const QUOTA_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
-/// Periodically refresh Claude session/weekly quota in the background so the
-/// popover paints fresh numbers instantly on open, and so quota stays current
-/// even while the popover is closed (the 5s foreground loop only runs when the
-/// UI is alive). Mirrors `schedule_update_checks`: spawned once at setup, gated
-/// on `Running`, and pushes results to the frontend via an event.
+/// Periodically refresh Claude session/weekly quota in the background so quota
+/// stays current even while the popover is closed (the 5s foreground loop only
+/// runs when the UI is alive). Mirrors `schedule_update_checks`: spawned once at
+/// setup, gated on the states where the server is live (`Running`/`UpdateAvailable`),
+/// and pushes results to the frontend via an event.
 fn schedule_quota_refresh(app: tauri::AppHandle) {
     std::thread::spawn(move || loop {
         std::thread::sleep(QUOTA_REFRESH_INTERVAL);
         let app_state = app.state::<AppState>();
-        let running = matches!(
+        let server_live = matches!(
             *app_state.server.lock().unwrap(),
-            ServerState::Running { .. }
+            ServerState::Running { .. } | ServerState::UpdateAvailable { .. }
         );
-        if !running {
+        if !server_live {
             continue;
         }
         let Some(key) = app_state.api_key.lock().unwrap().clone() else {
