@@ -644,7 +644,12 @@ pub fn run() {
             // Release builds used to log nowhere at all, which left silent exits
             // and supervisor decisions impossible to explain after the fact. Ship
             // a file log always; keep the noisy stdout target for dev only.
+            // clear_targets() first: `target()` APPENDS to the plugin's defaults
+            // (stdout + a LogDir file named after the app), so without it release
+            // builds keep an unreachable stdout target and write two identical
+            // log files.
             let mut logger = tauri_plugin_log::Builder::default()
+                .clear_targets()
                 .level(log::LevelFilter::Info)
                 .target(tauri_plugin_log::Target::new(
                     tauri_plugin_log::TargetKind::LogDir {
