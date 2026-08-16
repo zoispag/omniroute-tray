@@ -63,9 +63,40 @@ fn set_state(app: &tauri::AppHandle, next: ServerState) {
 }
 
 fn stop_managed_server(app: &tauri::AppHandle) {
-    if let Some(mut sup) = app.state::<AppState>().supervisor.lock().unwrap().take() {
+    let taken = app.state::<AppState>().supervisor.lock().unwrap().take();
+    if let Some(mut sup) = taken {
         let _ = sup.stop();
     }
+}
+
+/// Cycle the running server so it executes the version `current` now points at.
+///
+/// The supervisor is taken out of the mutex for the duration: this blocks for up
+/// to ~45s and a Quit arriving meanwhile must not wait on the lock on the UI
+/// thread. MUST run off the UI thread. Returns false when the old server refused
+/// to release the port or the replacement never became healthy.
+fn restart_managed_server(app: &tauri::AppHandle, version: &str) -> bool {
+    let taken = app.state::<AppState>().supervisor.lock().unwrap().take();
+    let Some(mut sup) = taken else {
+        return false;
+    };
+    sup.set_expected_version(version);
+    let restarted = sup.stop_and_wait()
+        && sup.spawn().is_ok()
+        && sup.wait_ready(std::time::Duration::from_secs(30));
+    *app.state::<AppState>().supervisor.lock().unwrap() = Some(sup);
+    restarted
+}
+
+/// Stop the running server and wait for the port to actually free, then bootstrap
+/// a fresh one. MUST run off the UI thread — `stop_and_wait` blocks.
+fn restart_flow(app: tauri::AppHandle) {
+    set_state(&app, ServerState::Starting);
+    let taken = app.state::<AppState>().supervisor.lock().unwrap().take();
+    if let Some(mut sup) = taken {
+        sup.stop_and_wait();
+    }
+    bootstrap(app);
 }
 
 fn install_with_retry(
@@ -158,13 +189,16 @@ fn bootstrap(app: tauri::AppHandle) {
         paths.state_dir.clone(),
         token,
     )
-    .with_log(log);
+    .with_log(log)
+    // Lets reconcile() spot a server left over from before an update: it answers
+    // on the port but still runs the version `current` pointed at when it started.
+    .with_expected_version(&version);
 
     use supervisor::Reconciliation;
     match supervisor.reconcile() {
         Ok(decision) => {
             let ready = match decision {
-                Reconciliation::SpawnFresh => {
+                Reconciliation::SpawnFresh | Reconciliation::ReplaceStale => {
                     supervisor.wait_ready(std::time::Duration::from_secs(20))
                 }
                 Reconciliation::Adopt | Reconciliation::ReconcileForeign => true,
@@ -195,25 +229,31 @@ fn bootstrap(app: tauri::AppHandle) {
     }
 
     *app.state::<AppState>().supervisor.lock().unwrap() = Some(supervisor);
-
-    monitor_health(app, version);
 }
 
 const HEALTH_FAILURES_BEFORE_ERROR: u32 = 3;
 
-fn monitor_health(app: tauri::AppHandle, version: String) {
+/// Spawned exactly once at app setup — NOT from `bootstrap()`, which re-runs on
+/// every restart and would leak a loop each time, each holding the version string
+/// captured at its own start and able to re-publish it long after an update.
+fn monitor_health(app: tauri::AppHandle) {
     std::thread::spawn(move || {
         let mut consecutive_failures: u32 = 0;
         loop {
             std::thread::sleep(std::time::Duration::from_secs(5));
             let responding = supervisor::server_responding(20128);
-            if responding {
+            let app_state = app.state::<AppState>();
+            let current = app_state.server.lock().unwrap().clone();
+            let version = app_state.active_version.lock().unwrap().clone();
+            // Misses only count while the server is meant to be up. Starting,
+            // Updating and Restarting legitimately leave the port dark, and
+            // carrying those misses forward would trip the debounce on the very
+            // first busy probe after the server comes back.
+            if responding || !current.is_running() {
                 consecutive_failures = 0;
             } else {
                 consecutive_failures += 1;
             }
-            let app_state = app.state::<AppState>();
-            let current = app_state.server.lock().unwrap().clone();
             match (&current, responding) {
                 // Debounced: a single missed probe is routinely just the server's
                 // event loop being busy (e.g. the settings pane fetching per-account
@@ -232,13 +272,15 @@ fn monitor_health(app: tauri::AppHandle, version: String) {
                     set_state(
                         &app,
                         ServerState::Running {
-                            version: Some(version.clone()),
+                            version: version.clone(),
                         },
                     );
                     // bootstrap() only runs check_for_update when wait_ready succeeds
                     // within 20s. A slow cold start lands in Error, recovers here, and
                     // would otherwise never learn about a pending update.
-                    check_for_update(&app, &version);
+                    if let Some(version) = &version {
+                        check_for_update(&app, version);
+                    }
                 }
                 _ => {}
             }
@@ -321,8 +363,29 @@ fn schedule_quota_refresh(app: tauri::AppHandle) {
     });
 }
 
+/// Rebuild the popover from its config. Only needed if the window was destroyed
+/// out from under us — we survive that now (see `RunEvent::ExitRequested`), and a
+/// tray whose popover never opens again would be worse than the crash it replaced.
+fn recreate_popover(app: &tauri::AppHandle) -> Option<tauri::WebviewWindow> {
+    let config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|w| w.label == POPOVER_LABEL)?
+        .clone();
+    log::warn!("popover window was gone; rebuilding it");
+    tauri::WebviewWindowBuilder::from_config(app, &config)
+        .ok()?
+        .build()
+        .ok()
+}
+
 fn toggle_popover(app: &tauri::AppHandle) {
-    let Some(window) = app.get_webview_window(POPOVER_LABEL) else {
+    let window = app
+        .get_webview_window(POPOVER_LABEL)
+        .or_else(|| recreate_popover(app));
+    let Some(window) = window else {
         return;
     };
     if window.is_visible().unwrap_or(false) {
@@ -351,9 +414,8 @@ fn get_port() -> u16 {
 
 #[tauri::command]
 fn restart_server(app: tauri::AppHandle) {
-    stop_managed_server(&app);
     let handle = app.clone();
-    std::thread::spawn(move || bootstrap(handle));
+    std::thread::spawn(move || restart_flow(handle));
 }
 
 #[tauri::command]
@@ -494,13 +556,36 @@ async fn apply_update(app: tauri::AppHandle, target: String) -> Result<String, S
             Ok(new_version) => {
                 let _ = node.repair_runtime(&paths.current_omniroute_entry());
                 *app.state::<AppState>().active_version.lock().unwrap() = Some(new_version.clone());
-                set_state(
-                    &app,
-                    ServerState::Running {
-                        version: Some(new_version.clone()),
-                    },
-                );
-                Ok(new_version)
+                // Swapping `current` does not touch the live daemon: it keeps
+                // serving the code it loaded at launch until it is cycled (#34).
+                if restart_managed_server(&app, &new_version) {
+                    set_state(
+                        &app,
+                        ServerState::Running {
+                            version: Some(new_version.clone()),
+                        },
+                    );
+                    Ok(new_version)
+                } else {
+                    // The old server is still up and still serving old code. Report
+                    // the version actually being served, not the one on disk, so the
+                    // popover (and the next update check) stay truthful.
+                    if let Some(served) =
+                        supervisor::running_server(20128).and_then(|s| s.version)
+                    {
+                        *app.state::<AppState>().active_version.lock().unwrap() = Some(served);
+                    }
+                    let reason = format!(
+                        "v{new_version} installed, but the running server could not be restarted — use Restart Server (see View Logs)"
+                    );
+                    set_state(
+                        &app,
+                        ServerState::Error {
+                            reason: reason.clone(),
+                        },
+                    );
+                    Err(reason)
+                }
             }
             Err(e) => {
                 // Never strand the UI in Updating: restore Running on failure.
@@ -556,13 +641,22 @@ pub fn run() {
         ))
         .manage(AppState::new())
         .setup(|app| {
+            // Release builds used to log nowhere at all, which left silent exits
+            // and supervisor decisions impossible to explain after the fact. Ship
+            // a file log always; keep the noisy stdout target for dev only.
+            let mut logger = tauri_plugin_log::Builder::default()
+                .level(log::LevelFilter::Info)
+                .target(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::LogDir {
+                        file_name: Some("tray".into()),
+                    },
+                ));
             if cfg!(debug_assertions) {
-                app.handle().plugin(
-                    tauri_plugin_log::Builder::default()
-                        .level(log::LevelFilter::Info)
-                        .build(),
-                )?;
+                logger = logger.target(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::Stdout,
+                ));
             }
+            app.handle().plugin(logger.build())?;
 
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -614,9 +708,8 @@ pub fn run() {
                             tauri_plugin_opener::open_url("http://127.0.0.1:20128", None::<&str>);
                     }
                     "restart" => {
-                        stop_managed_server(app);
                         let handle = app.clone();
-                        std::thread::spawn(move || bootstrap(handle));
+                        std::thread::spawn(move || restart_flow(handle));
                     }
                     "doctor" => {
                         if let Some(window) = app.get_webview_window(POPOVER_LABEL) {
@@ -645,14 +738,18 @@ pub fn run() {
 
             let handle = app.handle().clone();
             std::thread::spawn(move || bootstrap(handle));
+            monitor_health(app.handle().clone());
             schedule_update_checks(app.handle().clone());
             schedule_quota_refresh(app.handle().clone());
 
             Ok(())
         })
         .on_window_event(|window, event| {
-            if let WindowEvent::Focused(false) = event {
-                if window.label() == POPOVER_LABEL {
+            if window.label() != POPOVER_LABEL {
+                return;
+            }
+            match event {
+                WindowEvent::Focused(false) => {
                     let app_state = window.app_handle().state::<AppState>();
                     if app_state
                         .pin_open
@@ -662,6 +759,16 @@ pub fn run() {
                     }
                     let _ = window.hide();
                 }
+                // The popover is the app's ONLY window, and tao exits the process
+                // once the last window is destroyed. Closing it (⌘W while it has
+                // focus is enough) therefore took the whole tray app down with no
+                // crash report — just a silent exit(0). Hide instead; the window is
+                // only ever destroyed on a real quit.
+                WindowEvent::CloseRequested { api, .. } => {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+                _ => {}
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -686,7 +793,20 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
-            if let tauri::RunEvent::ExitRequested { .. } = event {
+            if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+                // `code` says who asked. `Some(_)` is `AppHandle::exit`, i.e. the
+                // Quit menu item — the only exit this app performs. `None` means
+                // tao is exiting because the last window was destroyed, which for
+                // a menu-bar app is never what the user meant: refuse it and keep
+                // the tray alive (the popover is rebuilt on the next click).
+                //
+                // Note this cannot block logout or shutdown: a system terminate
+                // arrives as `RunEvent::Exit`, never as `ExitRequested`.
+                if code.is_none() {
+                    log::warn!("exit requested by window teardown, not by Quit; staying alive");
+                    api.prevent_exit();
+                    return;
+                }
                 // Single cleanup site: stop our spawned server and clear the lockfile.
                 // Idempotent via the Mutex<Option<Supervisor>>::take() inside.
                 stop_managed_server(app_handle);
