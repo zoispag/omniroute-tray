@@ -15,7 +15,7 @@ export default defineConfig({
   },
   build: {
     target: "safari15",
-    minify: process.env.TAURI_ENV_DEBUG ? false : "esbuild",
+    minify: process.env.TAURI_ENV_DEBUG ? false : "oxc",
     sourcemap: !!process.env.TAURI_ENV_DEBUG,
   },
 });
