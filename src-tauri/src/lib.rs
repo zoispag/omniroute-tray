@@ -8,6 +8,7 @@ mod health;
 mod installer;
 mod lockfile;
 mod logfile;
+mod omniauth;
 mod paths;
 mod ratelimits;
 mod registry;
@@ -25,16 +26,21 @@ use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_positioner::{Position, WindowExt};
 
 use data::{CostResult, DataClient, QuotaRow};
+use omniauth::Credentials;
 use paths::AppPaths;
 use state::ServerState;
 
 const POPOVER_LABEL: &str = "popover";
+const SERVER_URL: &str = "http://127.0.0.1:20128";
 
 struct AppState {
     server: Mutex<ServerState>,
     data: Mutex<Option<DataClient>>,
     active_version: Mutex<Option<String>>,
-    api_key: Mutex<Option<String>>,
+    /// Bearer key + loopback CLI token presented on every management call.
+    /// Resolved at bootstrap; re-resolved lazily while the key is still missing
+    /// (a fresh install mints its first key only after the server starts).
+    auth: Mutex<Credentials>,
     supervisor: Mutex<Option<supervisor::Supervisor>>,
     pin_open: std::sync::atomic::AtomicBool,
     /// Last successful quota fetch. Warmed by `schedule_quota_refresh` and used by
@@ -49,7 +55,7 @@ impl AppState {
             server: Mutex::new(ServerState::Stopped),
             data: Mutex::new(None),
             active_version: Mutex::new(None),
-            api_key: Mutex::new(None),
+            auth: Mutex::new(Credentials::default()),
             supervisor: Mutex::new(None),
             pin_open: std::sync::atomic::AtomicBool::new(false),
             rate_limit_cache: Mutex::new(None),
@@ -171,14 +177,16 @@ fn bootstrap(app: tauri::AppHandle) {
 
     let entry = paths.current_omniroute_entry();
     let _ = node.repair_runtime(&entry);
-    let env_path = paths.omniroute_env_path();
-    let db_path = paths.omniroute_db_path();
     {
         let app_state = app.state::<AppState>();
         *app_state.data.lock().unwrap() =
             Some(DataClient::new(paths.node_bin.clone(), entry.clone()));
         *app_state.active_version.lock().unwrap() = Some(version.clone());
-        *app_state.api_key.lock().unwrap() = apikey::resolve(&env_path, &db_path);
+        let creds = resolve_credentials(&paths, None);
+        if creds.cli_token.is_none() {
+            log::warn!("could not derive the OmniRoute CLI token; management calls will rely on the API key alone");
+        }
+        *app_state.auth.lock().unwrap() = creds;
     }
 
     let token = format!("omniroute-tray-{}", std::process::id());
@@ -350,10 +358,11 @@ fn schedule_quota_refresh(app: tauri::AppHandle) {
         if !server_live {
             continue;
         }
-        let Some(key) = app_state.api_key.lock().unwrap().clone() else {
+        let creds = credentials_for_request(&app);
+        if creds.is_empty() {
             continue;
-        };
-        let Ok(limits) = ratelimits::fetch("http://127.0.0.1:20128", &key) else {
+        }
+        let Ok(limits) = ratelimits::fetch(SERVER_URL, &creds) else {
             continue;
         };
         *app_state.rate_limit_cache.lock().unwrap() = Some(limits.clone());
@@ -361,6 +370,41 @@ fn schedule_quota_refresh(app: tauri::AppHandle) {
             let _ = window.emit("quota-refreshed", limits);
         }
     });
+}
+
+/// Everything the tray can present to the local server: the shared API key from
+/// `.env`/`storage.sqlite` plus the machine-derived loopback CLI token (#42).
+/// The token depends only on the machine, so a `known_token` is reused instead
+/// of shelling out to `ioreg` again.
+fn resolve_credentials(paths: &AppPaths, known_token: Option<String>) -> Credentials {
+    let env_path = paths.omniroute_env_path();
+    let db_path = paths.omniroute_db_path();
+    Credentials {
+        api_key: apikey::resolve(&env_path, &db_path),
+        cli_token: known_token.or_else(|| omniauth::resolve_cli_token(&env_path)),
+    }
+}
+
+/// Credentials for one data request. Blocking (touches disk when re-resolving),
+/// so call it from `spawn_blocking`. While no API key is known yet, look again
+/// each time: on a fresh install the server creates `storage.sqlite` and its
+/// default key *after* bootstrap already resolved, and without this the popover
+/// would show the usage skeleton until the next tray restart.
+fn credentials_for_request(app: &tauri::AppHandle) -> Credentials {
+    let state = app.state::<AppState>();
+    let cached = state.auth.lock().unwrap().clone();
+    if cached.api_key.is_some() {
+        return cached;
+    }
+    let Ok(paths) = AppPaths::resolve(app) else {
+        return cached;
+    };
+    let fresh = resolve_credentials(&paths, cached.cli_token.clone());
+    if fresh.api_key.is_some() {
+        log::info!("OmniRoute API key became available; using it from now on");
+        *state.auth.lock().unwrap() = fresh.clone();
+    }
+    fresh
 }
 
 /// Rebuild the popover from its config. Only needed if the window was destroyed
@@ -452,14 +496,15 @@ async fn get_cost(state: tauri::State<'_, AppState>, range: String) -> Result<Co
 
 #[tauri::command]
 async fn get_rate_limits(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<ratelimits::AccountLimits>, String> {
-    let key = state.api_key.lock().unwrap().clone();
-    let Some(key) = key else {
-        return Ok(Vec::new());
-    };
     let fetched = tauri::async_runtime::spawn_blocking(move || {
-        ratelimits::fetch("http://127.0.0.1:20128", &key)
+        let creds = credentials_for_request(&app);
+        if creds.is_empty() {
+            return Ok(Vec::new());
+        }
+        ratelimits::fetch(SERVER_URL, &creds)
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -476,27 +521,24 @@ async fn get_rate_limits(
 }
 
 #[tauri::command]
-async fn get_usage_trend(
-    state: tauri::State<'_, AppState>,
-) -> Result<Option<analytics::UsageTrend>, String> {
-    let key = state.api_key.lock().unwrap().clone();
-    let Some(key) = key else {
-        return Ok(None);
-    };
+async fn get_usage_trend(app: tauri::AppHandle) -> Result<Option<analytics::UsageTrend>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        analytics::fetch("http://127.0.0.1:20128", &key, "30d")
+        let creds = credentials_for_request(&app);
+        if creds.is_empty() {
+            return Ok(None);
+        }
+        analytics::fetch(SERVER_URL, &creds, "30d").map(Some)
     })
     .await
     .map_err(|e| e.to_string())?
-    .map(Some)
     .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn get_health(state: tauri::State<'_, AppState>) -> Result<health::HealthStatus, String> {
-    let key = state.api_key.lock().unwrap().clone();
+async fn get_health(app: tauri::AppHandle) -> Result<health::HealthStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        health::fetch("http://127.0.0.1:20128", key.as_deref())
+        let creds = credentials_for_request(&app);
+        health::fetch(SERVER_URL, &creds)
     })
     .await
     .map_err(|e| e.to_string())

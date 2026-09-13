@@ -23,26 +23,25 @@ pub fn read_from_db(db_path: &Path) -> Option<String> {
     let conn =
         rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .ok()?;
-    conn.query_row(
-        "SELECT key FROM api_keys WHERE is_active = 1 AND revoked_at IS NULL AND key IS NOT NULL ORDER BY last_used_at DESC LIMIT 1",
-        [],
-        |row| row.get::<_, String>(0),
-    )
-    .ok()
+    // Prefer a key that carries a management scope: it is the only kind of
+    // Bearer the server accepts on management routes once login is required.
+    // `scopes` is a JSON array of strings (e.g. `["self:usage"]`). Older schemas
+    // have no `scopes` column, so fall back to plain recency if that query fails.
+    const SCOPED: &str = "SELECT key FROM api_keys \
+         WHERE is_active = 1 AND revoked_at IS NULL AND key IS NOT NULL \
+         ORDER BY (scopes LIKE '%\"manage\"%' OR scopes LIKE '%\"admin\"%') DESC, \
+                  last_used_at DESC \
+         LIMIT 1";
+    const RECENT: &str = "SELECT key FROM api_keys \
+         WHERE is_active = 1 AND revoked_at IS NULL AND key IS NOT NULL \
+         ORDER BY last_used_at DESC LIMIT 1";
+    let first = |sql: &str| conn.query_row(sql, [], |row| row.get::<_, String>(0));
+    first(SCOPED).or_else(|_| first(RECENT)).ok()
 }
 
 pub fn read_from_env_file(env_path: &Path) -> Option<String> {
     let contents = std::fs::read_to_string(env_path).ok()?;
-    for line in contents.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("OMNIROUTE_API_KEY=") {
-            let value = rest.trim().trim_matches('"').trim_matches('\'');
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-    }
-    None
+    crate::omniauth::env_value(&contents, "OMNIROUTE_API_KEY")
 }
 
 #[allow(dead_code)]
@@ -158,6 +157,28 @@ mod tests {
         .unwrap();
         drop(conn);
         assert_eq!(read_from_db(&db).as_deref(), Some("sk-active"));
+    }
+
+    #[test]
+    fn prefers_management_scoped_key_over_recent_inference_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("storage.sqlite");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "CREATE TABLE api_keys (key TEXT, is_active INTEGER, revoked_at TEXT, last_used_at TEXT, scopes TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            r#"INSERT INTO api_keys VALUES
+              ('sk-usage', 1, NULL, '2026-09-01', '["self:usage"]'),
+              ('sk-manage', 1, NULL, '2025-01-01', '["manage"]'),
+              ('sk-admin-revoked', 1, '2025-06-01', '2026-09-02', '["admin"]')"#,
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(read_from_db(&db).as_deref(), Some("sk-manage"));
     }
 
     #[test]

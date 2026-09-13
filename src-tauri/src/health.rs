@@ -1,13 +1,19 @@
 //! Verified upstream contract (OmniRoute v3.8.45, on 127.0.0.1:20128):
 //! - `GET /api/monitoring/health` (NO auth): `providerSummary.{activeCount,configuredCount}`, `circuitBreakers.{open,halfOpen}`, `providerHealth.<type>.state`.
-//! - `GET /api/providers` (Bearer): flat array of per-*account* connections `{provider, isActive}`; aggregated here by provider type.
-//! - `GET /api/telemetry/summary` (Bearer): top-level aggregate `p95`, `count`, `errorRate`.
+//! - `GET /api/providers` (management auth): flat array of per-*account* connections `{provider, isActive}`; aggregated here by provider type.
+//! - `GET /api/telemetry/summary` (management auth): top-level aggregate `p95`, `count`, `errorRate`.
+//!
+//! "Management auth" = Bearer key + loopback CLI token, see `omniauth`. A Bearer
+//! alone is refused (403) once the dashboard has a password, unless the key has
+//! the `manage` scope — the default key does not.
 //! - `GET /api/cache` (no auth): `promptCache.{totalRequests,requestsWithCacheControl,estimatedCostSaved}` — the provider-side prompt cache (the active one). The sibling `semanticCache` is opt-in and usually cold, so we deliberately ignore it. (`/api/cache/stats` only exposes the cold semantic cache — misleading.)
 
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::time::Duration;
+
+use crate::omniauth::Credentials;
 
 const TIMEOUT: Duration = Duration::from_secs(4);
 
@@ -40,24 +46,26 @@ pub struct HealthStatus {
     pub latency_sampled: bool,
 }
 
-pub fn fetch(base_url: &str, api_key: Option<&str>) -> HealthStatus {
+pub fn fetch(base_url: &str, creds: &Credentials) -> HealthStatus {
     let mut status = HealthStatus::default();
 
-    // Health and cache endpoints need no auth; always attempt them.
+    // The health endpoint is PUBLIC; sending credentials anyway is harmless and
+    // keeps one code path.
     let mut breaker_states: BTreeMap<String, bool> = BTreeMap::new();
-    if let Some(body) = get(&format!("{base_url}/api/monitoring/health"), None) {
+    if let Some(body) = get(&format!("{base_url}/api/monitoring/health"), creds) {
         breaker_states = apply_health(&mut status, &body);
     }
-    if let Some(body) = get(&format!("{base_url}/api/cache"), api_key) {
+    if let Some(body) = get(&format!("{base_url}/api/cache"), creds) {
         apply_cache(&mut status, &body);
     }
 
-    // Telemetry and the provider list require a Bearer key. Skip cleanly if unavailable.
-    if let Some(key) = api_key {
-        if let Some(body) = get(&format!("{base_url}/api/providers"), Some(key)) {
+    // Telemetry and the provider list are management routes. Skip cleanly when we
+    // hold nothing to present; a rejected request just leaves those fields empty.
+    if !creds.is_empty() {
+        if let Some(body) = get(&format!("{base_url}/api/providers"), creds) {
             apply_providers(&mut status, &body, &breaker_states);
         }
-        if let Some(body) = get(&format!("{base_url}/api/telemetry/summary"), Some(key)) {
+        if let Some(body) = get(&format!("{base_url}/api/telemetry/summary"), creds) {
             apply_telemetry(&mut status, &body);
         }
     }
@@ -65,11 +73,8 @@ pub fn fetch(base_url: &str, api_key: Option<&str>) -> HealthStatus {
     status
 }
 
-fn get(url: &str, api_key: Option<&str>) -> Option<Value> {
-    let mut req = ureq::get(url).timeout(TIMEOUT);
-    if let Some(key) = api_key {
-        req = req.set("Authorization", &format!("Bearer {key}"));
-    }
+fn get(url: &str, creds: &Credentials) -> Option<Value> {
+    let req = creds.apply(ureq::get(url).timeout(TIMEOUT));
     let body = req.call().ok()?.into_string().ok()?;
     serde_json::from_str(&body).ok()
 }

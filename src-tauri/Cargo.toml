@@ -1,6 +1,6 @@
 [package]
 name = "omniroute-tray"
-version = "0.1.15"
+version = "0.1.16"
 description = "A cross-platform tray app that supervises, monitors, and auto-updates the OmniRoute AI router."
 authors = ["OmniRouteTray contributors"]
 license = "MIT"
@@ -31,6 +31,9 @@ ureq = { version = "2", features = ["json"] }
 keyring = { version = "3", features = ["apple-native"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 chrono = "0.4"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

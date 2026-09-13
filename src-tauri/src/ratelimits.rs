@@ -2,12 +2,14 @@ use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::omniauth::Credentials;
+
 #[derive(Debug, Error)]
 pub enum RateLimitError {
     #[error("network error: {0}")]
     Network(String),
-    #[error("unauthorized")]
-    Unauthorized,
+    #[error("OmniRoute rejected the tray's credentials (HTTP {0})")]
+    Unauthorized(u16),
     #[error("parse error: {0}")]
     Parse(String),
 }
@@ -35,13 +37,13 @@ struct Connection {
     name: String,
 }
 
-pub fn fetch(base_url: &str, api_key: &str) -> Result<Vec<AccountLimits>, RateLimitError> {
-    let providers_raw = get(base_url, "/api/providers", api_key)?;
+pub fn fetch(base_url: &str, creds: &Credentials) -> Result<Vec<AccountLimits>, RateLimitError> {
+    let providers_raw = get(base_url, "/api/providers", creds)?;
     let connections = parse_connections(&providers_raw)?;
 
     let mut result = Vec::new();
     for conn in connections {
-        let usage_raw = match get(base_url, &format!("/api/usage/{}", conn.id), api_key) {
+        let usage_raw = match get(base_url, &format!("/api/usage/{}", conn.id), creds) {
             Ok(body) => body,
             Err(_) => continue,
         };
@@ -58,17 +60,16 @@ pub fn fetch(base_url: &str, api_key: &str) -> Result<Vec<AccountLimits>, RateLi
     Ok(result)
 }
 
-fn get(base_url: &str, path: &str, api_key: &str) -> Result<String, RateLimitError> {
+fn get(base_url: &str, path: &str, creds: &Credentials) -> Result<String, RateLimitError> {
     let url = format!("{base_url}{path}");
-    match ureq::get(&url)
-        .timeout(std::time::Duration::from_secs(4))
-        .set("Authorization", &format!("Bearer {api_key}"))
-        .call()
-    {
+    let req = creds.apply(ureq::get(&url).timeout(std::time::Duration::from_secs(4)));
+    match req.call() {
         Ok(resp) => resp
             .into_string()
             .map_err(|e| RateLimitError::Network(e.to_string())),
-        Err(ureq::Error::Status(401, _)) => Err(RateLimitError::Unauthorized),
+        // 401 = no usable credential; 403 = Bearer present but not a management
+        // token (an inference-only key with login enabled). Both are auth, not network.
+        Err(ureq::Error::Status(code @ (401 | 403), _)) => Err(RateLimitError::Unauthorized(code)),
         Err(e) => Err(RateLimitError::Network(e.to_string())),
     }
 }
