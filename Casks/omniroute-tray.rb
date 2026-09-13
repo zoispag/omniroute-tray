@@ -1,6 +1,6 @@
 cask "omniroute-tray" do
-  version "0.1.0"
-  sha256 "58702db82734a907eb1ca89c398a86bec8b44efc51eb83df8992c96fcb0af0f5"
+  version "0.1.16"
+  sha256 "1c4d0c5416f1b64e9cd4661c90d9d54801460851855b033194fdd11cfaee7f65"
 
   url "https://github.com/zoispag/omniroute-tray/releases/download/v#{version}/OmniRouteTray_#{version}_aarch64.dmg"
   name "OmniRouteTray"
@@ -11,10 +11,8 @@ cask "omniroute-tray" do
 
   app "OmniRouteTray.app"
 
-  postflight do
-    system_command "/usr/bin/xattr",
-                   args: ["-dr", "com.apple.quarantine", "#{appdir}/OmniRouteTray.app"],
-                   sudo: false
+  postflight_steps do
+    run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{appdir}}/OmniRouteTray.app"]
   end
 
   uninstall quit: "dev.omniroute.tray"
