@@ -89,22 +89,55 @@ pub fn derive_legacy_token(raw_id: &str, salt: &str) -> String {
     hex::encode(digest)[..32].to_string()
 }
 
-/// Parse `KEY=value` out of a dotenv body, stripping surrounding quotes.
+/// Read `key` out of a dotenv body the way `bin/omniroute.mjs` loads
+/// `~/.omniroute/.env`: blank and `#` lines skipped, split on the first `=`,
+/// first occurrence wins, value parsed by `parse_env_value`. Matching the
+/// server's reading matters here — a differently parsed `OMNIROUTE_CLI_SALT`
+/// would derive a token the server rejects.
 pub fn env_value(contents: &str, key: &str) -> Option<String> {
     for line in contents.lines() {
         let line = line.trim();
-        let line = line.strip_prefix("export ").unwrap_or(line);
-        if let Some(rest) = line.strip_prefix(key) {
-            let Some(rest) = rest.strip_prefix('=') else {
-                continue;
-            };
-            let value = rest.trim().trim_matches('"').trim_matches('\'');
-            if !value.is_empty() {
-                return Some(value.to_string());
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, raw)) = line.split_once('=') else {
+            continue;
+        };
+        if k.trim() != key {
+            continue;
+        }
+        let value = parse_env_value(raw);
+        return (!value.is_empty()).then_some(value);
+    }
+    None
+}
+
+/// Port of `bin/cli/utils/parseEnvValue.mjs`: a fully quoted value is returned
+/// verbatim (a `#` inside quotes is data; a trailing `# note` after the closing
+/// quote is dropped); in an unquoted value a `#` *preceded by whitespace*
+/// starts a comment, so `pass#word` survives while `custom # rotated` → `custom`.
+pub fn parse_env_value(raw: &str) -> String {
+    let value = raw.trim();
+    for quote in ['"', '\''] {
+        if let Some(rest) = value.strip_prefix(quote) {
+            // Closing quote followed only by whitespace and an optional comment.
+            if let Some(close) = rest.rfind(quote) {
+                let tail = rest[close + 1..].trim_start();
+                if tail.is_empty() || tail.starts_with('#') {
+                    return rest[..close].to_string();
+                }
             }
         }
     }
-    None
+    let mut cut = value.len();
+    let bytes = value.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        if *b == b'#' && i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            cut = i;
+            break;
+        }
+    }
+    value[..cut].trim().to_string()
 }
 
 #[cfg(target_os = "macos")]
@@ -121,11 +154,14 @@ fn raw_machine_id() -> Option<String> {
 
 #[cfg(target_os = "linux")]
 fn raw_machine_id() -> Option<String> {
+    // An empty or whitespace-only first file must not stop the search, so the
+    // second path stays a real fallback.
     ["/var/lib/dbus/machine-id", "/etc/machine-id"]
         .iter()
-        .find_map(|p| std::fs::read_to_string(p).ok())
-        .map(|s| normalize_id(&s))
-        .filter(|s| !s.is_empty())
+        .find_map(|p| {
+            let id = normalize_id(&std::fs::read_to_string(p).ok()?);
+            (!id.is_empty()).then_some(id)
+        })
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -188,18 +224,40 @@ mod tests {
     }
 
     #[test]
-    fn env_value_strips_quotes_and_export() {
-        let env = "FOO=1\nexport OMNIROUTE_CLI_SALT=\"custom-salt\"\nOMNIROUTE_CLI_TOKEN=\n";
+    fn env_value_follows_the_servers_dotenv_rules() {
+        let env = "# header\nFOO=1\n OMNIROUTE_CLI_SALT = \"custom-salt\" # rotated\nOMNIROUTE_CLI_TOKEN=\nOMNIROUTE_CLI_TOKEN=late\n";
         assert_eq!(
             env_value(env, "OMNIROUTE_CLI_SALT").as_deref(),
             Some("custom-salt")
         );
-        assert_eq!(env_value(env, "OMNIROUTE_CLI_TOKEN"), None);
+        assert_eq!(
+            env_value(env, "OMNIROUTE_CLI_TOKEN"),
+            None,
+            "first occurrence wins, like the server; an empty one is treated as unset"
+        );
         assert_eq!(
             env_value(env, "OMNIROUTE_CLI"),
             None,
             "prefix must not match"
         );
+        assert_eq!(
+            env_value("export FOO=1\n", "FOO"),
+            None,
+            "the server does not honour export"
+        );
+    }
+
+    // Mirrors the cases parseEnvValue.mjs documents (#10100).
+    #[test]
+    fn parse_env_value_matches_parse_env_value_mjs() {
+        assert_eq!(parse_env_value("custom # rotated"), "custom");
+        assert_eq!(parse_env_value("value  # note"), "value");
+        assert_eq!(parse_env_value("pass#word"), "pass#word");
+        assert_eq!(parse_env_value("  plain  "), "plain");
+        assert_eq!(parse_env_value("\"a # b\""), "a # b");
+        assert_eq!(parse_env_value("'a # b'  # note"), "a # b");
+        assert_eq!(parse_env_value("\"\""), "");
+        assert_eq!(parse_env_value("\"unterminated # x"), "\"unterminated");
     }
 
     #[test]
