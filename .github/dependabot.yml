@@ -14,3 +14,11 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # codeql.yml tracks the floating `v4` major tag on purpose. Without this,
+      # Dependabot reads `@v4` as version 4 and keeps proposing an exact pin to
+      # the latest 4.x (see #36), which downgrades as soon as it goes stale.
+      - dependency-name: github/codeql-action
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-patch
