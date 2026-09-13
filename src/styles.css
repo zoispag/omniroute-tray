@@ -576,6 +576,15 @@ body {
   margin-top: 10px;
 }
 
+/* Muted, in-section explanation (e.g. why a data section has nothing to show). */
+.section-note {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.4;
+  margin: 4px 0 0;
+  word-break: break-word;
+}
+
 .err-btn {
   flex: 1;
   padding: 7px;

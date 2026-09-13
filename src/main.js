@@ -67,13 +67,27 @@ async function refresh() {
       jobs.push(sectionVisible("usage") ? renderRateLimits() : hideSection("ratelimits"));
       jobs.push(sectionVisible("cost") ? renderCost() : hideSection("cost"));
       jobs.push(sectionVisible("trend") ? renderTrend() : hideSection("trend"));
-      await Promise.all(jobs);
+      // One section failing (e.g. a 403 from an auth-gated endpoint) must not
+      // take the others down with it, nor masquerade as a server error in the
+      // header — that is reserved for the server itself being unreachable.
+      const results = await Promise.allSettled(jobs);
+      for (const r of results) {
+        if (r.status === "rejected") console.warn("section failed:", r.reason);
+      }
     } else {
       clearSections();
     }
   } catch (err) {
     renderHeader({ state: "error", reason: String(err) });
   }
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 async function toggleSettings() {
@@ -228,13 +242,20 @@ function setAccountHidden(key, hidden) {
 }
 
 async function renderRateLimits() {
+  const section = document.getElementById("ratelimits");
   if (!rateLimitCache.length) {
-    document.getElementById("ratelimits").innerHTML = usageSkeleton();
+    section.innerHTML = usageSkeleton();
   }
   try {
     const data = await invoke("get_rate_limits");
     if (Array.isArray(data)) rateLimitCache = data;
-  } catch {
+  } catch (err) {
+    if (!rateLimitCache.length) {
+      // Nothing to fall back on: say why instead of spinning forever (#42).
+      section.innerHTML = `<div class="section-head"><h3>Usage</h3></div>
+        <p class="section-note">Usage unavailable: ${escapeHtml(err)}</p>`;
+      return;
+    }
     // keep last-known cache on transient failure
   }
   paintRateLimits();
@@ -533,8 +554,16 @@ function wireSparkline() {
 }
 
 async function renderTrend() {
-  const t = await invoke("get_usage_trend");
   const section = document.getElementById("trend");
+  let t;
+  try {
+    t = await invoke("get_usage_trend");
+  } catch (err) {
+    // The trend is a nice-to-have; a rejected fetch just hides it.
+    console.warn("usage trend unavailable:", err);
+    section.innerHTML = "";
+    return;
+  }
   if (!t || !t.days.length) {
     section.innerHTML = "";
     return;

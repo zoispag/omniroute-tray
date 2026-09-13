@@ -2,12 +2,14 @@ use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::omniauth::Credentials;
+
 #[derive(Debug, Error)]
 pub enum AnalyticsError {
     #[error("network error: {0}")]
     Network(String),
-    #[error("unauthorized")]
-    Unauthorized,
+    #[error("OmniRoute rejected the tray's credentials (HTTP {0})")]
+    Unauthorized(u16),
     #[error("parse error: {0}")]
     Parse(String),
 }
@@ -30,17 +32,20 @@ pub struct UsageTrend {
     pub total_tokens: f64,
 }
 
-pub fn fetch(base_url: &str, api_key: &str, period: &str) -> Result<UsageTrend, AnalyticsError> {
+pub fn fetch(
+    base_url: &str,
+    creds: &Credentials,
+    period: &str,
+) -> Result<UsageTrend, AnalyticsError> {
     let url = format!("{base_url}/api/usage/analytics?period={period}");
-    let body = match ureq::get(&url)
-        .timeout(std::time::Duration::from_secs(4))
-        .set("Authorization", &format!("Bearer {api_key}"))
-        .call()
-    {
+    let req = creds.apply(ureq::get(&url).timeout(std::time::Duration::from_secs(4)));
+    let body = match req.call() {
         Ok(resp) => resp
             .into_string()
             .map_err(|e| AnalyticsError::Network(e.to_string()))?,
-        Err(ureq::Error::Status(401, _)) => return Err(AnalyticsError::Unauthorized),
+        Err(ureq::Error::Status(code @ (401 | 403), _)) => {
+            return Err(AnalyticsError::Unauthorized(code))
+        }
         Err(e) => return Err(AnalyticsError::Network(e.to_string())),
     };
     parse(&body)
