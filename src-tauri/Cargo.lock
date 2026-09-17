@@ -2444,13 +2444,16 @@ dependencies = [
 
 [[package]]
 name = "omniroute-tray"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "chrono",
  "hex",
  "hmac",
  "keyring",
  "log",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "rusqlite",
  "semver",
  "serde",
