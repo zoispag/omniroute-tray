@@ -35,5 +35,25 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 
+# macOS 27 tray-click workaround (see src/traymenu.rs). Already in the tree via
+# tao/muda/tray-icon; declared here for the status item highlight and the OS check.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+  "std",
+  "NSApplication",
+  "NSButton",
+  "NSControl",
+  "NSResponder",
+  "NSStatusBarButton",
+  "NSView",
+  "NSWindow",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+  "std",
+  "NSArray",
+  "NSProcessInfo",
+] }
+
 [dev-dependencies]
 tempfile = "3"
