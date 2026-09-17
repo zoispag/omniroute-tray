@@ -16,12 +16,13 @@ use std::time::Duration;
 /// Hard cap on an accepted mark. Real assets are 1–5 KB; anything bigger is not a logo.
 const MAX_BYTES: usize = 256 * 1024;
 
-/// Provider ids whose mark lives under another name: OmniRoute's alias tables, the
-/// GitHub Copilot connection (provider id `github`, drawn with the Copilot mark), and
-/// the Zhipu family, whose `glm*`/`zai*` ids have no asset of their own.
+/// Provider ids whose mark lives under another name (OmniRoute's alias tables, plus
+/// the Zhipu family, whose `glm*`/`zai*` ids have no asset of their own).
+///
+/// Deliberately NOT here: `github` (the GitHub Copilot connection). The server's
+/// `copilot.svg` is Microsoft Copilot's mark; the GitHub one is bundled in
+/// `src/icons.js`, which the popover consults before asking the server.
 const ALIASES: &[(&str, &str)] = &[
-    ("github", "copilot"),
-    ("github-copilot", "copilot"),
     ("opencode-go", "opencode"),
     ("opencode-zen", "opencode"),
     ("poe-web", "poe"),
@@ -151,12 +152,11 @@ mod tests {
     }
 
     #[test]
-    fn github_copilot_connection_uses_the_copilot_mark() {
-        assert_eq!(candidates("github"), vec!["copilot", "github"]);
-        assert_eq!(
-            candidates("github-copilot"),
-            vec!["copilot", "github-copilot", "github"]
-        );
+    fn github_is_not_aliased_to_microsoft_copilot() {
+        // The GitHub Copilot mark is bundled in the frontend; the server's copilot.svg
+        // is a different product's logo and must never be picked up for `github`.
+        assert_eq!(candidates("github"), vec!["github"]);
+        assert!(!candidates("github-copilot").contains(&"copilot".to_string()));
     }
 
     #[test]
