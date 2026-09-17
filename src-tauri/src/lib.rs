@@ -10,6 +10,7 @@ mod lockfile;
 mod logfile;
 mod omniauth;
 mod paths;
+mod provider_icons;
 mod ratelimits;
 mod registry;
 mod runtime;
@@ -47,6 +48,11 @@ struct AppState {
     /// `get_rate_limits` as a fallback when a live fetch fails, so the UI keeps the
     /// last-known values instead of blanking.
     rate_limit_cache: Mutex<Option<Vec<ratelimits::AccountLimits>>>,
+    /// Provider marks fetched from the server's `/providers/<id>.svg`, keyed by
+    /// provider id. `None` records that the server has no mark for it (the popover
+    /// then shows a lettered badge); lookups that never reached the server are not
+    /// cached so they retry once it is up.
+    provider_icons: Mutex<std::collections::HashMap<String, Option<String>>>,
 }
 
 impl AppState {
@@ -59,6 +65,7 @@ impl AppState {
             supervisor: Mutex::new(None),
             pin_open: std::sync::atomic::AtomicBool::new(false),
             rate_limit_cache: Mutex::new(None),
+            provider_icons: Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -544,6 +551,37 @@ async fn get_health(app: tauri::AppHandle) -> Result<health::HealthStatus, Strin
     .map_err(|e| e.to_string())
 }
 
+/// The provider's brand mark as served by the local OmniRoute dashboard, or `None`
+/// when it has none. Errors only when the server could not be reached at all, so
+/// the popover can retry later instead of settling on the fallback badge.
+#[tauri::command]
+async fn get_provider_icon(
+    provider: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    let cached = state.provider_icons.lock().unwrap().get(&provider).cloned();
+    if let Some(hit) = cached {
+        return Ok(hit);
+    }
+    let id = provider.clone();
+    let lookup =
+        tauri::async_runtime::spawn_blocking(move || provider_icons::fetch(SERVER_URL, &id))
+            .await
+            .map_err(|e| e.to_string())?;
+    let mut cache = state.provider_icons.lock().unwrap();
+    match lookup {
+        provider_icons::Lookup::Found(svg) => {
+            cache.insert(provider, Some(svg.clone()));
+            Ok(Some(svg))
+        }
+        provider_icons::Lookup::Missing => {
+            cache.insert(provider, None);
+            Ok(None)
+        }
+        provider_icons::Lookup::Unreachable => Err("OmniRoute server unreachable".into()),
+    }
+}
+
 #[tauri::command]
 async fn get_tray_update() -> Result<github::TrayUpdate, String> {
     let current = env!("CARGO_PKG_VERSION").to_string();
@@ -825,6 +863,7 @@ pub fn run() {
             get_rate_limits,
             get_usage_trend,
             get_health,
+            get_provider_icon,
             get_tray_update,
             get_app_version,
             get_port,

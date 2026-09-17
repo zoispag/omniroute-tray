@@ -196,6 +196,47 @@ function accountKey(acc) {
   return `${acc.provider}/${acc.account}`;
 }
 
+// Inverse of accountKey. Provider ids never contain "/", account names might.
+function parseAccountKey(key) {
+  const i = key.indexOf("/");
+  return i < 0
+    ? { provider: key, account: "" }
+    : { provider: key.slice(0, i), account: key.slice(i + 1) };
+}
+
+// "qwen-cloud-token-plan" → "Qwen Cloud Token Plan".
+function providerLabel(provider) {
+  return provider
+    .split(/[-_\s]+/)
+    .filter(Boolean)
+    .map((w) => w[0].toUpperCase() + w.slice(1))
+    .join(" ");
+}
+
+// Several providers report the account as just "main", which says nothing once two
+// of them do it (#52). Name the provider instead so each Usage row is self-describing.
+const DEFAULT_ACCOUNT_NAMES = new Set(["main", "default"]);
+
+function accountLabel(acc) {
+  const name = String(acc.account ?? "").trim();
+  const generic =
+    !name ||
+    DEFAULT_ACCOUNT_NAMES.has(name.toLowerCase()) ||
+    name.toLowerCase() === String(acc.provider).toLowerCase();
+  return generic ? providerLabel(acc.provider) : name;
+}
+
+// Accounts the settings page lists: everything the server currently reports, plus
+// hidden accounts it no longer does (signed out, renamed, removed upstream). Without
+// the latter a hidden account that vanished upstream could never be re-enabled (#52).
+function settingsAccounts() {
+  const seen = new Set(rateLimitCache.map(accountKey));
+  const orphans = [...hiddenAccounts]
+    .filter((key) => !seen.has(key))
+    .map((key) => ({ ...parseAccountKey(key), windows: [], missing: true }));
+  return [...rateLimitCache, ...orphans];
+}
+
 function saveOrder() {
   localStorage.setItem("accountOrder", JSON.stringify(accountOrder));
 }
@@ -227,17 +268,191 @@ function groupByProvider(accounts) {
 
 let rateLimitCache = [];
 
+// ---- provider marks ----
+// Beyond the few marks bundled in icons.js, the local OmniRoute dashboard serves
+// one per provider at /providers/<id>.svg. The webview CSP forbids loading them
+// directly, so the Rust side fetches them and we inline the (normalised) SVG.
+// `null` records that the server has none — the lettered badge stays and we stop
+// asking for this session. A failed request (server not up yet) is not recorded,
+// so the next paint retries.
+const remoteIcons = new Map();
+const pendingIcons = new Set();
+
 function providerBadge(provider) {
-  const icon = PROVIDER_ICONS[provider];
-  if (icon) {
-    return `<span class="prov-badge" title="${provider}">${icon}</span>`;
+  const icon = PROVIDER_ICONS[provider] ?? remoteIcons.get(provider);
+  const attrs = `class="prov-badge" data-provider="${escapeHtml(provider)}" title="${escapeHtml(provider)}"`;
+  if (icon) return `<span ${attrs}>${icon}</span>`;
+  if (!remoteIcons.has(provider)) requestProviderIcon(provider);
+  return letterBadge(provider, attrs);
+}
+
+// Distinguishable stand-in for providers without a mark: first letter on a hue
+// derived from the id, so two unknown providers no longer look identical.
+function letterBadge(provider, attrs) {
+  const letter = (provider.match(/[a-z0-9]/i) || ["?"])[0].toUpperCase();
+  let hash = 0;
+  for (const ch of provider) hash = (hash * 31 + ch.charCodeAt(0)) >>> 0;
+  return `<span ${attrs.replace('class="prov-badge"', 'class="prov-badge prov-letter"')} style="--hue:${hash % 360}">${letter}</span>`;
+}
+
+function requestProviderIcon(provider) {
+  if (pendingIcons.has(provider)) return;
+  pendingIcons.add(provider);
+  invoke("get_provider_icon", { provider })
+    .then((svg) => {
+      const clean = svg ? normalizeSvg(svg, provider) : null;
+      remoteIcons.set(provider, clean);
+      if (clean) {
+        const html = providerBadge(provider);
+        document
+          .querySelectorAll(`.prov-badge[data-provider="${CSS.escape(provider)}"]`)
+          .forEach((el) => (el.outerHTML = html));
+      }
+    })
+    .catch(() => {})
+    .finally(() => pendingIcons.delete(provider));
+}
+
+const GRAY_TOLERANCE = 24;
+const NAMED_GRAYS = new Set(["white", "black", "gray", "grey", "silver", "gainsboro", "whitesmoke"]);
+
+// Parse a CSS colour into [r,g,b], or null for anything we don't recognise.
+function parseColor(raw) {
+  const v = raw.trim().toLowerCase();
+  if (NAMED_GRAYS.has(v)) return [0, 0, 0];
+  let m = v.match(/^#([0-9a-f]{3,4})$/);
+  if (m) return [...m[1].slice(0, 3)].map((c) => parseInt(c + c, 16));
+  m = v.match(/^#([0-9a-f]{6})(?:[0-9a-f]{2})?$/);
+  if (m) return [0, 2, 4].map((i) => parseInt(m[1].slice(i, i + 2), 16));
+  m = v.match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
+  if (m) return [m[1], m[2], m[3]].map(Number);
+  return null;
+}
+
+function isGrayish(raw) {
+  const rgb = parseColor(raw);
+  return !!rgb && Math.max(...rgb) - Math.min(...rgb) <= GRAY_TOLERANCE;
+}
+
+const PAINT_PROPS = ["fill", "stroke", "stop-color"];
+const NON_COLORS = /^(none|currentcolor|inherit|transparent|url\(.*)$/i;
+
+function paintColors(root) {
+  const colors = [];
+  const consider = (v) => {
+    if (v && !NON_COLORS.test(v.trim())) colors.push(v.trim());
+  };
+  for (const el of [root, ...root.querySelectorAll("*")]) {
+    for (const p of PAINT_PROPS) consider(el.getAttribute(p));
+    const style = el.getAttribute("style") || "";
+    for (const m of style.matchAll(/(?:fill|stroke|stop-color)\s*:\s*([^;]+)/gi)) consider(m[1]);
   }
-  return `<span class="prov-badge prov-fallback" title="${provider}">●</span>`;
+  for (const st of root.querySelectorAll("style")) {
+    for (const m of (st.textContent || "").matchAll(/(?:fill|stroke|stop-color)\s*:\s*([^;}]+)/gi)) consider(m[1]);
+  }
+  return colors;
+}
+
+const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// Inlined SVGs share the page's id space and their <style> rules apply document-wide.
+// Marks ship generic ids/classes (".st0", ".cls-1", gradient ids), so prefix every id
+// and pin every style rule under the root, or two providers' marks recolour each other.
+function scopeSvg(root, prefix) {
+  root.setAttribute("id", prefix);
+  const all = [root, ...root.querySelectorAll("*")];
+  const renames = all
+    .filter((el) => el !== root && el.getAttribute("id"))
+    .map((el) => [el.getAttribute("id"), `${prefix}-${el.getAttribute("id")}`])
+    .sort((a, b) => b[0].length - a[0].length);
+  const rewriteRefs = (text) =>
+    renames.reduce(
+      (acc, [from, to]) => acc.replace(new RegExp(`#${escapeRegExp(from)}(?![\\w-])`, "g"), `#${to}`),
+      text
+    );
+  for (const el of all) {
+    for (const attr of [...el.attributes]) {
+      if (attr.name !== "id" && attr.value.includes("#")) el.setAttribute(attr.name, rewriteRefs(attr.value));
+    }
+  }
+  for (const [from, to] of renames) root.querySelector(`[id="${from}"]`)?.setAttribute("id", to);
+  for (const st of root.querySelectorAll("style")) {
+    const css = rewriteRefs((st.textContent || "").replace(/\/\*[\s\S]*?\*\//g, ""));
+    st.textContent = css.replace(/([^{}]+)\{/g, (_, sel) =>
+      sel
+        .split(",")
+        .map((s) => `#${prefix} ${s.trim()}`)
+        .join(", ") + "{"
+    );
+  }
+}
+
+// Make a server-provided mark safe to inline and legible in both themes: drop
+// anything scriptable, fit it to the 16px badge, and turn monochrome marks (drawn
+// for one particular background — white for dark UIs, black for light) into
+// currentColor so they follow the text colour. Multi-colour brand marks are kept.
+function normalizeSvg(text, provider) {
+  let doc;
+  try {
+    doc = new DOMParser().parseFromString(text, "image/svg+xml");
+  } catch {
+    return null;
+  }
+  const root = doc.documentElement;
+  if (!root || root.localName !== "svg" || doc.querySelector("parsererror")) return null;
+
+  root.querySelectorAll("script, foreignObject, title, desc, metadata").forEach((el) => el.remove());
+  for (const el of [root, ...root.querySelectorAll("*")]) {
+    for (const attr of [...el.attributes]) {
+      const n = attr.name.toLowerCase();
+      const scriptable = n.startsWith("on") || (n.endsWith("href") && /^\s*(javascript|data):/i.test(attr.value));
+      if (scriptable) el.removeAttribute(attr.name);
+    }
+  }
+  scopeSvg(root, `pi-${String(provider).toLowerCase().replace(/[^a-z0-9]+/g, "-")}`);
+
+  const colors = paintColors(root);
+  if (colors.length === 0) {
+    // No explicit paint anywhere: SVG's default is black, invisible in dark mode.
+    root.setAttribute("fill", "currentColor");
+  } else if (colors.every(isGrayish)) {
+    const recolor = (css) => css.replace(/(fill|stroke|stop-color)\s*:\s*(?!none)[^;}]+/gi, "$1:currentColor");
+    for (const el of [root, ...root.querySelectorAll("*")]) {
+      for (const p of PAINT_PROPS) {
+        const v = el.getAttribute(p);
+        if (v && !NON_COLORS.test(v.trim())) el.setAttribute(p, "currentColor");
+      }
+      if (el.hasAttribute("style")) el.setAttribute("style", recolor(el.getAttribute("style")));
+    }
+    root.querySelectorAll("style").forEach((st) => (st.textContent = recolor(st.textContent || "")));
+    if (!root.getAttribute("fill")) root.setAttribute("fill", "currentColor");
+  }
+
+  if (!root.getAttribute("viewBox")) {
+    const w = parseFloat(root.getAttribute("width"));
+    const h = parseFloat(root.getAttribute("height"));
+    if (w > 0 && h > 0) root.setAttribute("viewBox", `0 0 ${w} ${h}`);
+  }
+  root.setAttribute("width", "16");
+  root.setAttribute("height", "16");
+  root.removeAttribute("style");
+  root.setAttribute("class", "prov-icon");
+  root.setAttribute("aria-hidden", "true");
+  return new XMLSerializer().serializeToString(root);
 }
 
 function setAccountHidden(key, hidden) {
   if (hidden) hiddenAccounts.add(key);
   else hiddenAccounts.delete(key);
+  saveHiddenAccounts();
+}
+
+function clearHiddenAccounts() {
+  hiddenAccounts.clear();
+  saveHiddenAccounts();
+}
+
+function saveHiddenAccounts() {
   localStorage.setItem("hiddenAccounts", JSON.stringify([...hiddenAccounts]));
 }
 
@@ -295,7 +510,7 @@ function paintRateLimits() {
     .map(([, accts]) => {
       const rows = accts
         .map((acc) => {
-          const head = `<div class="account">${providerBadge(acc.provider)}<span class="acct-name">${acc.account}</span></div>`;
+          const head = `<div class="account">${providerBadge(acc.provider)}<span class="acct-name" title="${escapeHtml(acc.account)}">${escapeHtml(accountLabel(acc))}</span></div>`;
           const windows = acc.windows
             .map((w) => {
               const used = w.used_percent;
@@ -584,34 +799,38 @@ async function renderSettings() {
     autostart = await invoke("get_autostart");
   } catch {}
 
-  const groups = groupByProvider(rateLimitCache);
+  const groups = groupByProvider(settingsAccounts());
   const providers = groups.map(([p]) => p);
-  const providerRows = groups
+  const accountRows = groups
     .map(([provider, accts], i) => {
+      const p = escapeHtml(provider);
       const acctList = accts
         .map((acc) => {
           const key = accountKey(acc);
           const checked = hiddenAccounts.has(key) ? "" : "checked";
+          const missing = acc.missing
+            ? `<span class="set-hint" title="OmniRoute no longer reports this account. Re-tick it to forget the hidden state.">not reported</span>`
+            : "";
           return `
-            <label class="set-acct">
-              <input type="checkbox" class="set-check" data-key="${key}" ${checked} />
-              <span class="acct-name">${acc.account}</span>
+            <label class="set-acct${acc.missing ? " set-missing" : ""}">
+              <input type="checkbox" class="set-check" data-key="${escapeHtml(key)}" ${checked} />
+              <span class="acct-name">${escapeHtml(acc.account)}</span>${missing}
             </label>`;
         })
         .join("");
       return `
-        <li class="set-row" data-provider="${provider}">
+        <li class="set-row" data-provider="${p}">
           <span class="set-reorder">
-            <button class="move-btn" data-provider="${provider}" data-dir="up" ${i === 0 ? "disabled" : ""}>▲</button>
-            <button class="move-btn" data-provider="${provider}" data-dir="down" ${i === providers.length - 1 ? "disabled" : ""}>▼</button>
+            <button class="move-btn" data-provider="${p}" data-dir="up" ${i === 0 ? "disabled" : ""}>▲</button>
+            <button class="move-btn" data-provider="${p}" data-dir="down" ${i === providers.length - 1 ? "disabled" : ""}>▼</button>
           </span>
           ${providerBadge(provider)}
-          <span class="set-provider-name">${provider}</span>
+          <span class="set-provider-name" title="${p}">${escapeHtml(providerLabel(provider))}</span>
           <span class="set-accts">${acctList}</span>
         </li>`;
     })
     .join("");
-  const accountRows = providerRows;
+  const showAll = `<button id="show-all-btn" class="mode-toggle" ${hiddenAccounts.size ? "" : "hidden"}>Show all</button>`;
 
   content.innerHTML = `
     <div class="settings-head">
@@ -647,7 +866,7 @@ async function renderSettings() {
       ).join("")}
     </div>
     <div class="section">
-      <h3>Accounts</h3>
+      <div class="section-head"><h3>Accounts</h3>${showAll}</div>
       <ul class="set-list" id="set-list">${accountRows}</ul>
     </div>`;
 
@@ -675,8 +894,20 @@ async function renderSettings() {
   content.querySelectorAll(".section-check").forEach((c) => {
     c.onchange = () => setSectionHidden(c.dataset.section, !c.checked);
   });
+  const showAllBtn = document.getElementById("show-all-btn");
+  if (showAllBtn) {
+    showAllBtn.onclick = () => {
+      clearHiddenAccounts();
+      renderSettings();
+    };
+  }
   content.querySelectorAll(".set-check").forEach((c) => {
-    c.onchange = () => setAccountHidden(c.dataset.key, !c.checked);
+    c.onchange = () => {
+      setAccountHidden(c.dataset.key, !c.checked);
+      // A row that only existed because it was hidden has nothing left to show.
+      if (c.checked && c.closest(".set-missing")) renderSettings();
+      else if (showAllBtn) showAllBtn.hidden = hiddenAccounts.size === 0;
+    };
   });
   content.querySelectorAll(".move-btn").forEach((b) => {
     b.onclick = () => moveProvider(b.dataset.provider, b.dataset.dir);
