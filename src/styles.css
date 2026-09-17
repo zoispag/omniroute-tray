@@ -335,9 +335,14 @@ body {
   color: #10a37f;
 }
 
-.prov-fallback {
-  color: var(--text-faint);
-  font-size: 10px;
+/* Providers without a mark: first letter on a per-provider hue (set inline as --hue). */
+.prov-letter {
+  border-radius: 4px;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+  color: hsl(var(--hue) 55% 36%);
+  background: hsl(var(--hue) 60% 50% / 0.16);
 }
 
 .acct-toggle {
@@ -932,6 +937,18 @@ body {
   cursor: pointer;
 }
 
+/* Hidden account the server no longer reports: listed so it can still be re-enabled. */
+.set-acct.set-missing {
+  color: var(--text-faint);
+}
+
+.set-hint {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
 .doctor-ok {
   color: var(--good);
   font-weight: 600;
@@ -969,5 +986,10 @@ body {
 
   #update button {
     color: #fff;
+  }
+
+  .prov-letter {
+    color: hsl(var(--hue) 70% 74%);
+    background: hsl(var(--hue) 60% 60% / 0.22);
   }
 }
