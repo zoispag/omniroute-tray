@@ -49,10 +49,20 @@ struct AppState {
     /// last-known values instead of blanking.
     rate_limit_cache: Mutex<Option<Vec<ratelimits::AccountLimits>>>,
     /// Provider marks fetched from the server's `/providers/<id>.svg`, keyed by
-    /// provider id. `None` records that the server has no mark for it (the popover
-    /// then shows a lettered badge); lookups that never reached the server are not
-    /// cached so they retry once it is up.
-    provider_icons: Mutex<std::collections::HashMap<String, Option<String>>>,
+    /// provider id and valid for one served OmniRoute version. `None` records that
+    /// the server has no mark for it (the popover then shows a lettered badge);
+    /// lookups that never reached the server are not cached so they retry once it
+    /// is up.
+    provider_icons: Mutex<ProviderIconCache>,
+}
+
+/// Marks are assets of the OmniRoute build being served, so the cache is tied to
+/// `active_version`: a restart or update onto another version drops every entry
+/// (including cached misses) and the next paint refetches from the new server.
+#[derive(Default)]
+struct ProviderIconCache {
+    version: Option<String>,
+    marks: std::collections::HashMap<String, Option<String>>,
 }
 
 impl AppState {
@@ -65,7 +75,7 @@ impl AppState {
             supervisor: Mutex::new(None),
             pin_open: std::sync::atomic::AtomicBool::new(false),
             rate_limit_cache: Mutex::new(None),
-            provider_icons: Mutex::new(std::collections::HashMap::new()),
+            provider_icons: Mutex::new(ProviderIconCache::default()),
         }
     }
 }
@@ -559,7 +569,17 @@ async fn get_provider_icon(
     provider: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<String>, String> {
-    let cached = state.provider_icons.lock().unwrap().get(&provider).cloned();
+    let served = state.active_version.lock().unwrap().clone();
+    let cached = {
+        let mut cache = state.provider_icons.lock().unwrap();
+        if cache.version != served {
+            // Another OmniRoute version is being served (restart, update, adopted
+            // daemon): its assets may differ, so forget everything learnt before.
+            cache.marks.clear();
+            cache.version = served.clone();
+        }
+        cache.marks.get(&provider).cloned()
+    };
     if let Some(hit) = cached {
         return Ok(hit);
     }
@@ -569,13 +589,20 @@ async fn get_provider_icon(
             .await
             .map_err(|e| e.to_string())?;
     let mut cache = state.provider_icons.lock().unwrap();
+    // If the served version moved while we were fetching, this answer describes the
+    // old server; hand it back for this paint but do not remember it.
+    let current = cache.version == served;
     match lookup {
         provider_icons::Lookup::Found(svg) => {
-            cache.insert(provider, Some(svg.clone()));
+            if current {
+                cache.marks.insert(provider, Some(svg.clone()));
+            }
             Ok(Some(svg))
         }
         provider_icons::Lookup::Missing => {
-            cache.insert(provider, None);
+            if current {
+                cache.marks.insert(provider, None);
+            }
             Ok(None)
         }
         provider_icons::Lookup::Unreachable => Err("OmniRoute server unreachable".into()),
