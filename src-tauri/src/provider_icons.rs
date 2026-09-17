@@ -110,7 +110,12 @@ pub fn fetch(base_url: &str, provider: &str) -> Lookup {
                     .into_reader()
                     .take(MAX_BYTES as u64 + 1)
                     .read_to_string(&mut body);
-                if read.is_err() || body.len() > MAX_BYTES || !looks_like_svg(&body) {
+                if read.is_err() {
+                    // The asset is there; we just failed to read it. Retry later.
+                    transient = true;
+                    continue;
+                }
+                if body.len() > MAX_BYTES || !looks_like_svg(&body) {
                     continue;
                 }
                 return Lookup::Found(body);

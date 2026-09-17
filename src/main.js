@@ -411,10 +411,185 @@ function presentationStyle(style) {
     .join("; ");
 }
 
-// Make a server-provided mark safe to inline and legible in both themes: drop
-// anything scriptable, fit it to the 16px badge, and turn monochrome marks (drawn
-// for one particular background — white for dark UIs, black for light) into
-// currentColor so they follow the text colour. Multi-colour brand marks are kept.
+// The server on :20128 is adopted, not necessarily ours, so a fetched mark is
+// untrusted input. Only inert drawing primitives survive, with an attribute
+// allowlist; anything that navigates, loads, animates or scripts is dropped.
+const SVG_ELEMENTS = new Set([
+  "svg",
+  "g",
+  "path",
+  "circle",
+  "ellipse",
+  "rect",
+  "line",
+  "polyline",
+  "polygon",
+  "defs",
+  "lineargradient",
+  "radialgradient",
+  "stop",
+  "clippath",
+  "mask",
+  "use",
+  "symbol",
+  "style",
+  // Inert filter primitives (blur/glow, as in Gemini's mark). feImage is NOT here:
+  // it loads a URL.
+  "filter",
+  "fegaussianblur",
+  "feflood",
+  "feblend",
+  "fecolormatrix",
+  "feoffset",
+  "fecomposite",
+  "femerge",
+  "femergenode",
+]);
+const SVG_ATTRS = new Set([
+  "id",
+  "class",
+  "style",
+  "d",
+  "x",
+  "y",
+  "x1",
+  "y1",
+  "x2",
+  "y2",
+  "cx",
+  "cy",
+  "r",
+  "rx",
+  "ry",
+  "fx",
+  "fy",
+  "fr",
+  "width",
+  "height",
+  "viewbox",
+  "points",
+  "transform",
+  "fill",
+  "fill-rule",
+  "fill-opacity",
+  "stroke",
+  "stroke-width",
+  "stroke-linecap",
+  "stroke-linejoin",
+  "stroke-miterlimit",
+  "stroke-dasharray",
+  "stroke-dashoffset",
+  "stroke-opacity",
+  "opacity",
+  "color",
+  "clip-path",
+  "clip-rule",
+  "mask",
+  "gradientunits",
+  "gradienttransform",
+  "spreadmethod",
+  "offset",
+  "stop-color",
+  "stop-opacity",
+  "clippathunits",
+  "maskunits",
+  "maskcontentunits",
+  "preserveaspectratio",
+  "xmlns",
+  "xmlns:xlink",
+  "version",
+  "filter",
+  "filterunits",
+  "primitiveunits",
+  "color-interpolation-filters",
+  "stddeviation",
+  "flood-color",
+  "flood-opacity",
+  "in",
+  "in2",
+  "mode",
+  "operator",
+  "result",
+  "type",
+  "values",
+  "dx",
+  "dy",
+]);
+const STYLE_PROPS = new Set([
+  ...PRESENTATION_PROPS,
+  "stop-color",
+  "stop-opacity",
+  "clip-rule",
+  "mask-type",
+]);
+
+// Keep only allowlisted declarations, dropping anything that could load or lay out.
+function sanitizeDeclarations(css) {
+  return css
+    .split(";")
+    .map((d) => d.trim())
+    .filter((d) => {
+      const [prop, value] = d.split(/:(.*)/s);
+      return (
+        d && STYLE_PROPS.has(prop.trim().toLowerCase()) && !/url\((?!\s*['"]?#)/i.test(value || "")
+      );
+    })
+    .join("; ");
+}
+
+// Rebuild a <style> sheet from its rules, keeping only allowlisted declarations.
+function sanitizeStyleSheet(css) {
+  const rules = [];
+  for (const m of css.replace(/\/\*[\s\S]*?\*\//g, "").matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    const decls = sanitizeDeclarations(m[2]);
+    if (decls) rules.push(`${m[1].trim()}{${decls}}`);
+  }
+  return rules.join("\n");
+}
+
+function sanitizeSvg(root) {
+  for (const el of [...root.querySelectorAll("*")]) {
+    if (!SVG_ELEMENTS.has(el.localName.toLowerCase())) {
+      // Unwrap containers we don't know (e.g. <a>, <switch>) so the drawing inside
+      // survives; anything else (script, image, animate…, foreignObject) goes.
+      if (["a", "switch"].includes(el.localName.toLowerCase())) el.replaceWith(...el.childNodes);
+      else el.remove();
+    }
+  }
+  for (const el of [root, ...root.querySelectorAll("*")]) {
+    for (const attr of [...el.attributes]) {
+      const n = attr.name.toLowerCase();
+      if (n === "href" || n === "xlink:href") {
+        // Only local fragment references (gradients, <use> of a <symbol>).
+        if (!/^\s*#[\w-]+\s*$/.test(attr.value)) el.removeAttribute(attr.name);
+        continue;
+      }
+      if (!SVG_ATTRS.has(n)) {
+        el.removeAttribute(attr.name);
+        continue;
+      }
+      if (n === "style") {
+        const clean = sanitizeDeclarations(attr.value);
+        if (clean) el.setAttribute("style", clean);
+        else el.removeAttribute("style");
+      } else if (/url\((?!\s*['"]?#)/i.test(attr.value)) {
+        // fill="url(https://…)" and friends: external paint servers are not allowed.
+        el.removeAttribute(attr.name);
+      }
+    }
+  }
+  for (const st of root.querySelectorAll("style")) {
+    const clean = sanitizeStyleSheet(st.textContent || "");
+    if (clean) st.textContent = clean;
+    else st.remove();
+  }
+}
+
+// Make a server-provided mark safe to inline and legible in both themes: reduce it
+// to allowlisted inert drawing elements, fit it to the 16px badge, and turn
+// monochrome marks (drawn for one particular background — white for dark UIs,
+// black for light) into currentColor so they follow the text colour. Multi-colour
+// brand marks are kept.
 function normalizeSvg(text, provider) {
   let doc;
   try {
@@ -425,14 +600,7 @@ function normalizeSvg(text, provider) {
   const root = doc.documentElement;
   if (!root || root.localName !== "svg" || doc.querySelector("parsererror")) return null;
 
-  root.querySelectorAll("script, foreignObject, title, desc, metadata").forEach((el) => el.remove());
-  for (const el of [root, ...root.querySelectorAll("*")]) {
-    for (const attr of [...el.attributes]) {
-      const n = attr.name.toLowerCase();
-      const scriptable = n.startsWith("on") || (n.endsWith("href") && /^\s*(javascript|data):/i.test(attr.value));
-      if (scriptable) el.removeAttribute(attr.name);
-    }
-  }
+  sanitizeSvg(root);
   scopeSvg(root, `pi-${String(provider).toLowerCase().replace(/[^a-z0-9]+/g, "-")}`);
 
   const colors = paintColors(root);
