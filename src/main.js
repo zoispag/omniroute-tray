@@ -314,6 +314,7 @@ function requestProviderIcon(provider) {
 }
 
 const GRAY_TOLERANCE = 24;
+const MAX_MARK_ASPECT = 2;
 const NAMED_GRAYS = new Set(["white", "black", "gray", "grey", "silver", "gainsboro", "whitesmoke"]);
 
 // Parse a CSS colour into [r,g,b], or null for anything we don't recognise.
@@ -455,6 +456,13 @@ function normalizeSvg(text, provider) {
     const w = parseFloat(root.getAttribute("width"));
     const h = parseFloat(root.getAttribute("height"));
     if (w > 0 && h > 0) root.setAttribute("viewBox", `0 0 ${w} ${h}`);
+  }
+  // A wordmark (e.g. 234×42) squeezed into a 16px square is an unreadable smear;
+  // the letter badge says more. Only roughly square marks are worth inlining.
+  const box = (root.getAttribute("viewBox") || "").trim().split(/[\s,]+/).map(Number);
+  if (box.length === 4 && box[2] > 0 && box[3] > 0) {
+    const ratio = box[2] / box[3];
+    if (ratio > MAX_MARK_ASPECT || ratio < 1 / MAX_MARK_ASPECT) return null;
   }
   root.setAttribute("width", "16");
   root.setAttribute("height", "16");
