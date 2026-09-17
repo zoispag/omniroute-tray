@@ -56,6 +56,7 @@ async function refresh() {
   try {
     const status = await invoke("get_status");
     lastStatus = status;
+    noteServerVersion(status.version);
     renderHeader(status);
     if (inSettings) {
       return;
@@ -278,6 +279,25 @@ let rateLimitCache = [];
 const remoteIcons = new Map();
 const pendingIcons = new Set();
 
+// Marks belong to the OmniRoute build that served them, and `remoteIcons` lives for
+// the whole session — so an update would keep painting the old build's marks until
+// the tray restarted. Every version change drops them and bumps a generation, which
+// also discards answers from a request that was in flight across the swap.
+let servedVersion;
+let iconGeneration = 0;
+
+function noteServerVersion(version) {
+  // Ignore "unknown" (server down / restarting): only a real version-to-version
+  // move means different assets. A restart on the same build serves the same files.
+  if (!version) return;
+  if (servedVersion && servedVersion !== version) {
+    remoteIcons.clear();
+    pendingIcons.clear();
+    iconGeneration += 1;
+  }
+  servedVersion = version;
+}
+
 function providerBadge(provider) {
   const icon = PROVIDER_ICONS[provider] ?? remoteIcons.get(provider);
   const attrs = `class="prov-badge" data-provider="${escapeHtml(provider)}" title="${escapeHtml(provider)}"`;
@@ -298,8 +318,10 @@ function letterBadge(provider, attrs) {
 function requestProviderIcon(provider) {
   if (pendingIcons.has(provider)) return;
   pendingIcons.add(provider);
+  const generation = iconGeneration;
   invoke("get_provider_icon", { provider })
     .then((svg) => {
+      if (generation !== iconGeneration) return; // answer from the previous server
       const clean = svg ? normalizeSvg(svg, provider) : null;
       remoteIcons.set(provider, clean);
       if (clean) {
@@ -310,7 +332,11 @@ function requestProviderIcon(provider) {
       }
     })
     .catch(() => {})
-    .finally(() => pendingIcons.delete(provider));
+    .finally(() => {
+      // A newer generation owns the entry now; deleting it would let a duplicate
+      // request start for a provider already being fetched against the new server.
+      if (generation === iconGeneration) pendingIcons.delete(provider);
+    });
 }
 
 const GRAY_TOLERANCE = 24;

@@ -588,10 +588,15 @@ async fn get_provider_icon(
         tauri::async_runtime::spawn_blocking(move || provider_icons::fetch(SERVER_URL, &id))
             .await
             .map_err(|e| e.to_string())?;
+    // Re-read the LIVE version, not `cache.version`: the latter only moves when a
+    // lookup runs, so it cannot tell us whether the server was replaced while this
+    // fetch was in flight. Locked in the same order as above (active_version, then
+    // provider_icons) so the two can never deadlock.
+    let live = state.active_version.lock().unwrap().clone();
     let mut cache = state.provider_icons.lock().unwrap();
     // If the served version moved while we were fetching, this answer describes the
     // old server; hand it back for this paint but do not remember it.
-    let current = cache.version == served;
+    let current = live == served && cache.version == served;
     match lookup {
         provider_icons::Lookup::Found(svg) => {
             if current {
