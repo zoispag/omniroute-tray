@@ -64,14 +64,15 @@ pub fn candidates(provider: &str) -> Vec<String> {
     if let Some(a) = aliased {
         push(a);
     }
-    push(&id);
     // `openai-compatible-<uuid>` / `anthropic-compatible-<uuid>` are user-defined
     // endpoints (Ollama, a corporate gateway…). Shortening them would land on the
-    // OpenAI/Anthropic brand mark, which is exactly the wrong claim to make;
-    // OmniRoute itself shows a text badge for these. Leave them to the letter badge.
+    // OpenAI/Anthropic brand mark, which is exactly the wrong claim to make, and
+    // OmniRoute itself shows a text badge for these. No candidates at all: they
+    // are never looked up and always get the letter badge.
     if GENERIC_PREFIXES.iter().any(|p| id.starts_with(p)) {
         return out;
     }
+    push(&id);
     let mut cur = id.as_str();
     while let Some(i) = cur.rfind('-') {
         cur = &cur[..i];
@@ -83,13 +84,24 @@ pub fn candidates(provider: &str) -> Vec<String> {
 const GENERIC_PREFIXES: &[&str] = &["openai-compatible", "anthropic-compatible"];
 
 /// Fetch the first mark the server has for `provider`.
+///
+/// `Missing` is only returned when EVERY candidate was definitively absent. If any
+/// candidate failed transiently (timeout, 429, 5xx) and none was found, the answer
+/// is `Unreachable`, because a preferred alias might exist and merely be unavailable
+/// right now — caching `Missing` there would pin the fallback badge until restart.
 pub fn fetch(base_url: &str, provider: &str) -> Lookup {
-    let mut reachable = false;
-    for id in candidates(provider) {
+    let ids = candidates(provider);
+    if ids.is_empty() {
+        // Nothing to ask for (user-defined `*-compatible` node): definitively no mark.
+        return Lookup::Missing;
+    }
+    let mut transient = false;
+    for id in ids {
         let url = format!("{base_url}/providers/{id}.svg");
         match ureq::get(&url).timeout(Duration::from_secs(3)).call() {
             Ok(resp) => {
-                reachable = true;
+                // A 200 that is not an SVG (e.g. an HTML page) is a definitive miss
+                // for this candidate.
                 if !resp.content_type().contains("svg") {
                     continue;
                 }
@@ -106,14 +118,14 @@ pub fn fetch(base_url: &str, provider: &str) -> Lookup {
             // The Next.js server answers unknown assets with a 404 HTML page. Any
             // other status (429, 5xx, a proxy hiccup) says nothing about whether the
             // asset exists, so it must not turn into a cached `Missing`.
-            Err(ureq::Error::Status(code, _)) if is_definitive_miss(code) => reachable = true,
-            Err(_) => {}
+            Err(ureq::Error::Status(code, _)) if is_definitive_miss(code) => {}
+            Err(_) => transient = true,
         }
     }
-    if reachable {
-        Lookup::Missing
-    } else {
+    if transient {
         Lookup::Unreachable
+    } else {
+        Lookup::Missing
     }
 }
 
@@ -160,13 +172,19 @@ mod tests {
     }
 
     #[test]
-    fn user_defined_compatible_endpoints_never_borrow_a_brand_mark() {
+    fn user_defined_compatible_endpoints_are_never_looked_up() {
         let id = "openai-compatible-chat-6739873e-d0f7-4f94-8533-510c8652eb36";
-        assert_eq!(candidates(id), vec![id]);
-        assert_eq!(
-            candidates("anthropic-compatible-x"),
-            vec!["anthropic-compatible-x"]
-        );
+        assert!(candidates(id).is_empty());
+        assert!(candidates("anthropic-compatible-x").is_empty());
+        // No candidates → no request at all, and a definitive (cacheable) miss even
+        // when the server is nowhere to be found.
+        assert_eq!(fetch("http://127.0.0.1:1", id), Lookup::Missing);
+    }
+
+    #[test]
+    fn unreachable_server_is_not_a_miss() {
+        // Nothing listens on port 1: every candidate fails transiently.
+        assert_eq!(fetch("http://127.0.0.1:1", "kimi"), Lookup::Unreachable);
     }
 
     #[test]
