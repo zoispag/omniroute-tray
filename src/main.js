@@ -387,6 +387,29 @@ function scopeSvg(root, prefix) {
   }
 }
 
+const PRESENTATION_PROPS = new Set([
+  "fill",
+  "fill-rule",
+  "fill-opacity",
+  "stroke",
+  "stroke-width",
+  "stroke-linecap",
+  "stroke-linejoin",
+  "stroke-opacity",
+  "opacity",
+  "color",
+]);
+
+// Keep only the declarations that affect how the mark is painted.
+function presentationStyle(style) {
+  if (!style) return "";
+  return style
+    .split(";")
+    .map((d) => d.trim())
+    .filter((d) => PRESENTATION_PROPS.has(d.split(":")[0].trim().toLowerCase()))
+    .join("; ");
+}
+
 // Make a server-provided mark safe to inline and legible in both themes: drop
 // anything scriptable, fit it to the 16px badge, and turn monochrome marks (drawn
 // for one particular background — white for dark UIs, black for light) into
@@ -435,7 +458,11 @@ function normalizeSvg(text, provider) {
   }
   root.setAttribute("width", "16");
   root.setAttribute("height", "16");
-  root.removeAttribute("style");
+  // lobehub marks carry layout styles (flex:none; line-height:1) that fight the
+  // badge; paint properties on the root are part of the drawing and must stay.
+  const rootStyle = presentationStyle(root.getAttribute("style"));
+  if (rootStyle) root.setAttribute("style", rootStyle);
+  else root.removeAttribute("style");
   root.setAttribute("class", "prov-icon");
   root.setAttribute("aria-hidden", "true");
   return new XMLSerializer().serializeToString(root);
@@ -915,7 +942,8 @@ async function renderSettings() {
 }
 
 function moveProvider(provider, dir) {
-  const providers = groupByProvider(rateLimitCache).map(([p]) => p);
+  // Same provider set the settings list was rendered from, orphans included.
+  const providers = groupByProvider(settingsAccounts()).map(([p]) => p);
   const i = providers.indexOf(provider);
   const j = dir === "up" ? i - 1 : i + 1;
   if (i < 0 || j < 0 || j >= providers.length) return;

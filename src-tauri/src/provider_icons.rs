@@ -90,8 +90,10 @@ pub fn fetch(base_url: &str, provider: &str) -> Lookup {
                 }
                 return Lookup::Found(body);
             }
-            // The Next.js server answers unknown assets with a 404 HTML page.
-            Err(ureq::Error::Status(_, _)) => reachable = true,
+            // The Next.js server answers unknown assets with a 404 HTML page. Any
+            // other status (429, 5xx, a proxy hiccup) says nothing about whether the
+            // asset exists, so it must not turn into a cached `Missing`.
+            Err(ureq::Error::Status(code, _)) if is_definitive_miss(code) => reachable = true,
             Err(_) => {}
         }
     }
@@ -100,6 +102,11 @@ pub fn fetch(base_url: &str, provider: &str) -> Lookup {
     } else {
         Lookup::Unreachable
     }
+}
+
+/// Statuses that prove the asset is not there, as opposed to a transient failure.
+fn is_definitive_miss(code: u16) -> bool {
+    matches!(code, 404 | 410)
 }
 
 fn looks_like_svg(body: &str) -> bool {
@@ -136,6 +143,18 @@ mod tests {
         assert_eq!(candidates(" Claude "), vec!["claude"]);
         assert_eq!(candidates("glm"), vec!["zhipu", "glm"]);
         assert!(candidates("").is_empty());
+    }
+
+    #[test]
+    fn only_not_found_is_a_cacheable_miss() {
+        assert!(is_definitive_miss(404));
+        assert!(is_definitive_miss(410));
+        for transient in [429, 500, 502, 503, 504] {
+            assert!(
+                !is_definitive_miss(transient),
+                "{transient} must retry later"
+            );
+        }
     }
 
     #[test]
