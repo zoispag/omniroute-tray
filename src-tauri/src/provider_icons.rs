@@ -16,9 +16,12 @@ use std::time::Duration;
 /// Hard cap on an accepted mark. Real assets are 1–5 KB; anything bigger is not a logo.
 const MAX_BYTES: usize = 256 * 1024;
 
-/// Provider ids whose mark lives under another name (OmniRoute's alias tables, plus
-/// the Zhipu family, whose `glm*`/`zai*` ids have no asset of their own).
+/// Provider ids whose mark lives under another name: OmniRoute's alias tables, the
+/// GitHub Copilot connection (provider id `github`, drawn with the Copilot mark), and
+/// the Zhipu family, whose `glm*`/`zai*` ids have no asset of their own.
 const ALIASES: &[(&str, &str)] = &[
+    ("github", "copilot"),
+    ("github-copilot", "copilot"),
     ("opencode-go", "opencode"),
     ("opencode-zen", "opencode"),
     ("poe-web", "poe"),
@@ -61,6 +64,13 @@ pub fn candidates(provider: &str) -> Vec<String> {
         push(a);
     }
     push(&id);
+    // `openai-compatible-<uuid>` / `anthropic-compatible-<uuid>` are user-defined
+    // endpoints (Ollama, a corporate gateway…). Shortening them would land on the
+    // OpenAI/Anthropic brand mark, which is exactly the wrong claim to make;
+    // OmniRoute itself shows a text badge for these. Leave them to the letter badge.
+    if GENERIC_PREFIXES.iter().any(|p| id.starts_with(p)) {
+        return out;
+    }
     let mut cur = id.as_str();
     while let Some(i) = cur.rfind('-') {
         cur = &cur[..i];
@@ -68,6 +78,8 @@ pub fn candidates(provider: &str) -> Vec<String> {
     }
     out
 }
+
+const GENERIC_PREFIXES: &[&str] = &["openai-compatible", "anthropic-compatible"];
 
 /// Fetch the first mark the server has for `provider`.
 pub fn fetch(base_url: &str, provider: &str) -> Lookup {
@@ -136,6 +148,25 @@ mod tests {
     fn suffixed_plan_ids_fall_back_to_the_brand() {
         assert_eq!(candidates("kimi-coding"), vec!["kimi-coding", "kimi"]);
         assert_eq!(candidates("minimax-cn"), vec!["minimax-cn", "minimax"]);
+    }
+
+    #[test]
+    fn github_copilot_connection_uses_the_copilot_mark() {
+        assert_eq!(candidates("github"), vec!["copilot", "github"]);
+        assert_eq!(
+            candidates("github-copilot"),
+            vec!["copilot", "github-copilot", "github"]
+        );
+    }
+
+    #[test]
+    fn user_defined_compatible_endpoints_never_borrow_a_brand_mark() {
+        let id = "openai-compatible-chat-6739873e-d0f7-4f94-8533-510c8652eb36";
+        assert_eq!(candidates(id), vec![id]);
+        assert_eq!(
+            candidates("anthropic-compatible-x"),
+            vec!["anthropic-compatible-x"]
+        );
     }
 
     #[test]
