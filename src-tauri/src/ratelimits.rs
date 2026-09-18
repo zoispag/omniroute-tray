@@ -196,6 +196,13 @@ impl ProbeLog {
         )
     }
 
+    /// When this account was last probed (completed or reserved); `None` if never.
+    fn last_attempt(&self, id: &str) -> Option<Instant> {
+        self.entries
+            .get(id)
+            .map(|p| p.reserved_at.map_or(p.at, |r| r.max(p.at)))
+    }
+
     /// Numbers from the last probe that returned any.
     fn last_windows(&self, id: &str) -> Option<&[Window]> {
         self.entries.get(id).and_then(|p| p.windows.as_deref())
@@ -284,10 +291,13 @@ pub fn fetch(
         due
     };
 
-    let live: HashMap<String, (ProbeOutcome, Option<Vec<Window>>)> = due
+    // Each probe carries its own completion time: they run one after the other,
+    // and the gap before an account's next attempt counts from when ITS probe
+    // ended, not from the start or end of the batch.
+    let live: HashMap<String, (ProbeOutcome, Option<Vec<Window>>, Instant)> = due
         .into_iter()
         .map(|id| {
-            let outcome = match probe_live(base_url, &id, creds) {
+            let (outcome, windows) = match probe_live(base_url, &id, creds) {
                 Ok(l) if l.stale => (ProbeOutcome::Stale, Some(l.windows)),
                 Ok(l) => (ProbeOutcome::Fresh, Some(l.windows)),
                 Err(RateLimitError::Unsupported) => (ProbeOutcome::Unsupported, None),
@@ -296,17 +306,14 @@ pub fn fetch(
                     (ProbeOutcome::Failed, None)
                 }
             };
-            (id, outcome)
+            (id, (outcome, windows, Instant::now()))
         })
         .collect();
 
-    // Recorded at completion, not at batch start: the probes run one after the
-    // other, and the gap before the next attempt counts from when this one ended.
-    let done = Instant::now();
     let log = {
         let mut log = probes.lock().unwrap();
-        for (id, (outcome, windows)) in &live {
-            log.record(id, *outcome, windows.clone(), done);
+        for (id, (outcome, windows, done)) in &live {
+            log.record(id, *outcome, windows.clone(), *done);
         }
         log
     };
@@ -320,11 +327,11 @@ pub fn fetch(
             .is_some_and(|age| age >= 0 && (age as u128) < REFRESH_AFTER.as_millis());
 
         match live.get(&conn.id) {
-            Some((ProbeOutcome::Fresh, Some(w))) => {
+            Some((ProbeOutcome::Fresh, Some(w), _)) => {
                 windows = Some(w.clone());
                 fresh = true;
             }
-            Some((ProbeOutcome::Stale, Some(w))) => {
+            Some((ProbeOutcome::Stale, Some(w), _)) => {
                 windows = Some(w.clone());
                 fresh = false;
             }
@@ -335,8 +342,10 @@ pub fn fetch(
         if windows.is_none() {
             windows = log.last_windows(&conn.id).map(<[Window]>::to_vec);
         }
-        // Confirmed without a usage API: whatever the cache still holds is obsolete.
-        let unsupported = log.unsupported(&conn.id);
+        // Confirmed without a usage API: whatever the cache still holds is
+        // obsolete — unless OmniRoute has since written a usable entry for it,
+        // which means the usage API works now and the hour-old verdict does not.
+        let unsupported = log.unsupported(&conn.id) && !usage.contains_key(&conn.id);
         if unsupported {
             windows = Some(Vec::new());
         }
@@ -368,26 +377,37 @@ pub fn fetch(
 
 /// Which active accounts get a live `/api/usage/<id>` this round: those with no
 /// cache entry or one older than `REFRESH_AFTER`, that have not been probed
-/// within `PROBE_GAP` (or, for unsupported ones, `UNSUPPORTED_RECHECK`), most
-/// overdue first, at most `MAX_PROBES_PER_FETCH`. `age_ms` is `None` for an
-/// account OmniRoute holds no entry for — those go first.
+/// within `PROBE_GAP` (or, for unsupported ones, `UNSUPPORTED_RECHECK`), at most
+/// `MAX_PROBES_PER_FETCH`. `age_ms` is `None` for an account OmniRoute holds no
+/// entry for — those go first, never-probed ones ahead of the least recently
+/// probed, so that with no cache at all (an older OmniRoute) every account gets
+/// its turn instead of the same three winning each round. Stale entries follow,
+/// oldest first.
 fn plan_probes(
     candidates: &[(String, Option<i64>)],
     probes: &ProbeLog,
     now: Instant,
 ) -> Vec<String> {
-    let mut due: Vec<(i64, &str)> = candidates
+    // Sort key, ascending: (0 = missing entry, 1 = stale entry; then how long
+    // since the last probe for missing ones — never probed = longest — or how
+    // stale the entry is for the rest, inverted so oldest sorts first; then id).
+    let mut due: Vec<((u8, i64, i64), &str)> = candidates
         .iter()
         .filter(|(id, _)| probes.may_probe(id, now))
         .filter_map(|(id, age)| match age {
-            None => Some((i64::MAX, id.as_str())),
+            None => {
+                let since_probe = probes
+                    .last_attempt(id)
+                    .map_or(i64::MAX, |t| now.duration_since(t).as_millis() as i64);
+                Some(((0, -since_probe, 0), id.as_str()))
+            }
             Some(age) if *age < 0 || (*age as u128) >= REFRESH_AFTER.as_millis() => {
-                Some((*age, id.as_str()))
+                Some(((1, 0, -*age), id.as_str()))
             }
             Some(_) => None,
         })
         .collect();
-    due.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    due.sort();
     due.truncate(MAX_PROBES_PER_FETCH);
     due.into_iter().map(|(_, id)| id.to_string()).collect()
 }
@@ -1139,6 +1159,36 @@ mod tests {
     }
 
     #[test]
+    fn with_no_cache_at_all_every_account_gets_its_turn() {
+        // An older OmniRoute: no entry for anyone. Round one takes three; after
+        // the gap, round two must start with the two that were skipped, not the
+        // same three again (the closed-popover refresh is the only caller then).
+        let t0 = Instant::now();
+        let mut log = ProbeLog::default();
+        let candidates: Vec<(String, Option<i64>)> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|id| (id.to_string(), None))
+            .collect();
+        let round1 = plan_probes(&candidates, &log, t0);
+        assert_eq!(round1, vec!["a", "b", "c"]);
+        for id in &round1 {
+            log.record(id, ProbeOutcome::Failed, None, t0);
+        }
+        let round2 = plan_probes(&candidates, &log, t0 + PROBE_GAP * 5);
+        assert_eq!(round2[..2], ["d", "e"], "never probed go first");
+        assert_eq!(round2[2], "a", "then the least recently probed");
+        for id in &round2 {
+            log.record(id, ProbeOutcome::Failed, None, t0 + PROBE_GAP * 5);
+        }
+        let round3 = plan_probes(&candidates, &log, t0 + PROBE_GAP * 10);
+        assert_eq!(
+            round3,
+            vec!["b", "c", "a"],
+            "b and c are the oldest; a, d and e tie on time and the id decides"
+        );
+    }
+
+    #[test]
     fn a_failed_probe_is_not_retried_until_the_gap_has_passed() {
         let t0 = Instant::now();
         let mut log = ProbeLog::default();
@@ -1197,17 +1247,21 @@ mod tests {
     /// live probes go only to stale/missing entries, and a second fetch right after
     /// the first probes nothing (so it only touches the local database).
     #[test]
-    #[ignore = "live test: requires a running OmniRoute on OMNIROUTE_LIVE_PORT"]
+    #[ignore = "live test: requires a running OmniRoute on OMNIROUTE_LIVE_PORT and a credential in OMNIROUTE_LIVE_CLI_TOKEN or OMNIROUTE_LIVE_API_KEY"]
     fn live_fetch_reads_the_cache_and_throttles_probes() {
         let port = std::env::var("OMNIROUTE_LIVE_PORT").expect("OMNIROUTE_LIVE_PORT");
         let base = format!("http://127.0.0.1:{port}");
-        let env_path = std::path::PathBuf::from(std::env::var("HOME").expect("HOME"))
-            .join(".omniroute")
-            .join(".env");
+        // Credentials come from the environment, never from `~/.omniroute/.env`
+        // (a test must not read that file). The loopback token is
+        // `printf omniroute-cli-auth-v1 | openssl dgst -sha256 -hmac <IOPlatformUUID, lower-cased>`.
         let creds = Credentials {
-            api_key: None,
-            cli_token: crate::omniauth::resolve_cli_token(&env_path),
+            api_key: std::env::var("OMNIROUTE_LIVE_API_KEY").ok(),
+            cli_token: std::env::var("OMNIROUTE_LIVE_CLI_TOKEN").ok(),
         };
+        assert!(
+            !creds.is_empty(),
+            "set OMNIROUTE_LIVE_CLI_TOKEN or OMNIROUTE_LIVE_API_KEY"
+        );
         let probes = Mutex::new(ProbeLog::default());
 
         let t = Instant::now();
