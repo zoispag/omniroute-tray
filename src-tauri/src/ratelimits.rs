@@ -300,10 +300,13 @@ pub fn fetch(
         })
         .collect();
 
+    // Recorded at completion, not at batch start: the probes run one after the
+    // other, and the gap before the next attempt counts from when this one ended.
+    let done = Instant::now();
     let log = {
         let mut log = probes.lock().unwrap();
         for (id, (outcome, windows)) in &live {
-            log.record(id, *outcome, windows.clone(), now);
+            log.record(id, *outcome, windows.clone(), done);
         }
         log
     };
