@@ -343,9 +343,14 @@ pub fn fetch(
             windows = log.last_windows(&conn.id).map(<[Window]>::to_vec);
         }
         // Confirmed without a usage API: whatever the cache still holds is
-        // obsolete — unless OmniRoute has since written a usable entry for it,
+        // obsolete — unless OmniRoute wrote a usable entry AFTER that verdict,
         // which means the usage API works now and the hour-old verdict does not.
-        let unsupported = log.unsupported(&conn.id) && !usage.contains_key(&conn.id);
+        // An entry older than the verdict is exactly the obsolete data to drop.
+        let unsupported = log.unsupported(&conn.id)
+            && !entry_postdates_verdict(
+                usage.get(&conn.id).and_then(|u| u.age_ms),
+                log.last_attempt(&conn.id).map(|t| now.duration_since(t)),
+            );
         if unsupported {
             windows = Some(Vec::new());
         }
@@ -510,6 +515,16 @@ fn is_error_only_entry(entry: &serde_json::Map<String, Value>) -> bool {
         .and_then(Value::as_str)
         .is_some_and(|m| !m.trim().is_empty());
     !has_quotas && has_message
+}
+
+/// Whether a cache entry `age_ms` old was written after a verdict reached
+/// `since_verdict` ago. `None` age (no usable entry, or no readable `fetchedAt`)
+/// never postdates anything; `None` verdict means there is nothing to supersede.
+fn entry_postdates_verdict(age_ms: Option<i64>, since_verdict: Option<Duration>) -> bool {
+    match (age_ms, since_verdict) {
+        (Some(age), Some(since)) => age >= 0 && (age as u128) < since.as_millis(),
+        _ => false,
+    }
 }
 
 /// Milliseconds since the entry's `fetchedAt`; `None` when it carries none we can read.
@@ -1401,6 +1416,28 @@ mod tests {
         );
         assert!(!log.unavailable("f"), "the completed retry clears it");
         assert!(log.unsupported("u"), "untouched accounts keep theirs");
+    }
+
+    #[test]
+    fn only_a_cache_entry_newer_than_the_unsupported_verdict_supersedes_it() {
+        let since = Some(secs(600));
+        assert!(
+            entry_postdates_verdict(Some(30_000), since),
+            "written 30s ago, verdict 10min ago: the usage API works now"
+        );
+        assert!(
+            !entry_postdates_verdict(Some(3_600_000), since),
+            "an hour-old entry is the obsolete data the verdict is about"
+        );
+        assert!(!entry_postdates_verdict(None, since), "no usable entry");
+        assert!(
+            !entry_postdates_verdict(Some(30_000), None),
+            "no verdict: nothing to supersede (and nothing to clear)"
+        );
+        assert!(
+            !entry_postdates_verdict(Some(-5_000), since),
+            "clock skew is not freshness"
+        );
     }
 
     #[test]
