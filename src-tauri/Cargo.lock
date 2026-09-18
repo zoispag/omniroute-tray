@@ -2444,7 +2444,7 @@ dependencies = [
 
 [[package]]
 name = "omniroute-tray"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "chrono",
  "hex",

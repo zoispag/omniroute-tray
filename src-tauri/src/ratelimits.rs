@@ -1,8 +1,31 @@
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 
 use crate::omniauth::Credentials;
+
+/// Age at which a cached usage entry is worth a live refresh. OmniRoute's own
+/// scheduler only resyncs every 70 minutes, so without this the bars would be
+/// as stale as the dashboard's; with it, an account is at most about a minute
+/// behind — while a poll every 5s no longer hits the upstream provider each time.
+pub const REFRESH_AFTER: Duration = Duration::from_secs(60);
+/// Minimum gap between two live probes of one account, whatever the outcome.
+/// A failing upstream is retried once a minute, not every poll (#61).
+const PROBE_GAP: Duration = Duration::from_secs(60);
+/// OmniRoute answered "Usage not available for this connection" (HTTP 400): the
+/// provider has no usage API. That does not change from one poll to the next.
+const UNSUPPORTED_RECHECK: Duration = Duration::from_secs(60 * 60);
+/// Live probes per fetch. Spreads a cold start over a few polls instead of firing
+/// every account's upstream request in one burst.
+const MAX_PROBES_PER_FETCH: usize = 3;
+/// Budget for a live probe: OmniRoute may mint a token and call the provider.
+const LIVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Budget for reads that only touch OmniRoute's own database.
+const LOCAL_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[derive(Debug, Error)]
 pub enum RateLimitError {
@@ -16,6 +39,10 @@ pub enum RateLimitError {
     Unauthorized(u16),
     #[error("parse error: {0}")]
     Parse(String),
+    /// OmniRoute has no usage API for this provider (HTTP 400 on
+    /// `/api/usage/<id>`). An answer, not a failure: the account has no usage.
+    #[error("OmniRoute reports no usage for this connection")]
+    Unsupported,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -54,35 +81,372 @@ struct Connection {
     active: bool,
 }
 
-pub fn fetch(base_url: &str, creds: &Credentials) -> Result<Vec<AccountLimits>, RateLimitError> {
-    let providers_raw = get(base_url, "/api/providers", creds)?;
+/// What the tray remembers about its own live probes, per connection id. Lives in
+/// `AppState` and outlives a single `fetch`, so a failed upstream lookup is not
+/// retried on the very next poll, its outcome keeps labelling the account until
+/// a later probe succeeds, and the numbers a probe returned stay available to the
+/// polls in between (an older OmniRoute without the cache endpoint has no other
+/// source for them). Locked only to plan and to record probes, never across I/O.
+#[derive(Debug, Default)]
+pub struct ProbeLog {
+    entries: HashMap<String, Probe>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Probe {
+    /// When the last probe completed (or, for a never-completed entry, when it
+    /// was first reserved).
+    at: Instant,
+    /// Outcome of the last COMPLETED probe. A reservation does not touch it, so
+    /// the label an account carries survives an in-flight retry.
+    outcome: Option<ProbeOutcome>,
+    /// Set while a fetch is probing this account off the lock.
+    reserved_at: Option<Instant>,
+    /// Windows from the last probe that returned numbers, kept across failures
+    /// and dropped once the provider is confirmed to have no usage API.
+    windows: Option<Vec<Window>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ProbeOutcome {
+    /// `/api/usage/<id>` returned fresh numbers.
+    Fresh,
+    /// OmniRoute could not reach the provider and served its own previous entry
+    /// (`_stale: true`). Numbers exist, but they are not the latest.
+    Stale,
+    /// Network error, timeout, or a non-2xx answer other than the 400 below.
+    Failed,
+    /// HTTP 400 "Usage not available for this connection": no usage API.
+    Unsupported,
+}
+
+impl ProbeLog {
+    fn may_probe(&self, id: &str, now: Instant) -> bool {
+        match self.entries.get(id) {
+            None => true,
+            Some(p) => {
+                let gap = match p.outcome {
+                    Some(ProbeOutcome::Unsupported) => UNSUPPORTED_RECHECK,
+                    _ => PROBE_GAP,
+                };
+                // A reservation counts like an attempt: an overlapping fetch waits
+                // for it, and an abandoned one expires after the same gap.
+                let last = p.reserved_at.map_or(p.at, |r| r.max(p.at));
+                now.duration_since(last) >= gap
+            }
+        }
+    }
+
+    /// Claim `ids` for a probe that is about to run without the lock, so an
+    /// overlapping fetch does not probe the same accounts. The last completed
+    /// outcome and its numbers are untouched — they keep labelling the account
+    /// until the retry actually finishes.
+    fn reserve(&mut self, ids: &[String], now: Instant) {
+        for id in ids {
+            let entry = self.entries.entry(id.clone()).or_insert(Probe {
+                at: now,
+                outcome: None,
+                reserved_at: None,
+                windows: None,
+            });
+            entry.reserved_at = Some(now);
+        }
+    }
+
+    /// `windows` is `Some` only for a probe that returned numbers; a failure keeps
+    /// the last ones, an unsupported answer drops them (they are obsolete).
+    fn record(
+        &mut self,
+        id: &str,
+        outcome: ProbeOutcome,
+        windows: Option<Vec<Window>>,
+        now: Instant,
+    ) {
+        let entry = self.entries.entry(id.to_string()).or_insert(Probe {
+            at: now,
+            outcome: None,
+            reserved_at: None,
+            windows: None,
+        });
+        entry.at = now;
+        entry.outcome = Some(outcome);
+        entry.reserved_at = None;
+        match outcome {
+            ProbeOutcome::Unsupported => entry.windows = None,
+            _ => {
+                if windows.is_some() {
+                    entry.windows = windows;
+                }
+            }
+        }
+    }
+
+    /// Drop an `Unsupported` verdict that OmniRoute's cache has since disproved
+    /// (it wrote a usable entry after the probe). The account goes back to the
+    /// normal probe gap and is no longer rendered as having no usage API.
+    fn retract_unsupported(&mut self, id: &str) {
+        if let Some(p) = self.entries.get_mut(id) {
+            if p.outcome == Some(ProbeOutcome::Unsupported) {
+                p.outcome = None;
+            }
+        }
+    }
+
+    /// The last completed probe did not produce fresh numbers.
+    fn unavailable(&self, id: &str) -> bool {
+        matches!(
+            self.entries.get(id).and_then(|p| p.outcome),
+            Some(ProbeOutcome::Failed | ProbeOutcome::Stale)
+        )
+    }
+
+    fn unsupported(&self, id: &str) -> bool {
+        matches!(
+            self.entries.get(id).and_then(|p| p.outcome),
+            Some(ProbeOutcome::Unsupported)
+        )
+    }
+
+    /// When this account was last probed (completed or reserved); `None` if never.
+    fn last_attempt(&self, id: &str) -> Option<Instant> {
+        self.entries
+            .get(id)
+            .map(|p| p.reserved_at.map_or(p.at, |r| r.max(p.at)))
+    }
+
+    /// Numbers from the last probe that returned any.
+    fn last_windows(&self, id: &str) -> Option<&[Window]> {
+        self.entries.get(id).and_then(|p| p.windows.as_deref())
+    }
+
+    /// Drop memory of connections OmniRoute no longer reports.
+    fn retain(&mut self, ids: &[String]) {
+        self.entries.retain(|id, _| ids.contains(id));
+    }
+}
+
+/// One account's cached usage as OmniRoute keeps it (`/api/usage/provider-limits`):
+/// the windows we could read from its `quotas`, and how old the entry is.
+#[derive(Debug)]
+struct CachedUsage {
+    windows: Vec<Window>,
+    age_ms: Option<i64>,
+}
+
+pub fn fetch(
+    base_url: &str,
+    creds: &Credentials,
+    probes: &Mutex<ProbeLog>,
+) -> Result<Vec<AccountLimits>, RateLimitError> {
+    let providers_raw = get(base_url, "/api/providers", creds, LOCAL_TIMEOUT)?;
     let connections = parse_connections(&providers_raw)?;
 
-    // Every connection OmniRoute knows about is returned, windows or not. The
-    // popover only draws the ones with usage, but Settings needs the full list:
-    // an account that drops out of it can never be un-hidden again (#52, #57).
+    // The dashboard's source: OmniRoute's own per-connection usage cache, one read
+    // for every account and no upstream traffic. `/api/usage/<id>` is the other
+    // path — a LIVE call to the provider on every request. Polling that every 5s
+    // for every account is what made an account flap to "usage unavailable"
+    // (timeouts, upstream rate limits) while the dashboard, reading the cache,
+    // showed it fine (#61). A missing map (an older OmniRoute, or a failed read)
+    // is not fatal: every account then goes through the throttled live path
+    // below, and the ones it has no numbers for are flagged so the caller keeps
+    // their last known bars.
+    let cached = match get(base_url, "/api/usage/provider-limits", creds, LOCAL_TIMEOUT)
+        .and_then(|raw| parse_provider_limits(&raw))
+    {
+        Ok(map) => Some(map),
+        Err(e @ RateLimitError::Unauthorized(_)) => return Err(e),
+        Err(e) => {
+            log::debug!("provider-limits cache unavailable, probing live: {e}");
+            None
+        }
+    };
+
+    let now = Instant::now();
+    let now_ms = unix_millis();
+
+    let mut usage: HashMap<String, CachedUsage> = HashMap::new();
+    for conn in &connections {
+        if let Some(entry) = cached
+            .as_ref()
+            .and_then(|c| c.get(&conn.id))
+            .filter(|e| !is_error_only_entry(e))
+        {
+            // An entry we cannot read is treated like no entry: the live probe
+            // decides, and failing that the account is flagged, not blanked.
+            if let Ok(windows) = windows_from_body(entry) {
+                usage.insert(
+                    conn.id.clone(),
+                    CachedUsage {
+                        windows,
+                        age_ms: entry_age_ms(entry, now_ms),
+                    },
+                );
+            }
+        }
+    }
+
+    let candidates: Vec<(String, Option<i64>)> = connections
+        .iter()
+        .filter(|c| c.active)
+        .map(|c| (c.id.clone(), usage.get(&c.id).and_then(|u| u.age_ms)))
+        .collect();
+
+    // Plan under the lock, probe without it: a probe may take seconds, and the
+    // 5s poll must not queue behind the background refresh (or vice versa).
+    let ids: Vec<String> = connections.iter().map(|c| c.id.clone()).collect();
+    let due = {
+        let mut log = probes.lock().unwrap();
+        log.retain(&ids);
+        // An `Unsupported` verdict is disproved by a usable entry OmniRoute wrote
+        // AFTER the probe that produced it: the usage API works now. Retract it
+        // before planning, or the account would sit out the hour-long recheck
+        // gap (and be rendered as having no usage) despite live data in the cache.
+        for (id, age) in &candidates {
+            if log.unsupported(id)
+                && entry_postdates_verdict(
+                    *age,
+                    log.last_attempt(id).map(|t| now.duration_since(t)),
+                )
+            {
+                log.retract_unsupported(id);
+            }
+        }
+        let due = plan_probes(&candidates, &log, now);
+        log.reserve(&due, now);
+        due
+    };
+
+    // Each probe carries its own completion time: they run one after the other,
+    // and the gap before an account's next attempt counts from when ITS probe
+    // ended, not from the start or end of the batch.
+    let live: HashMap<String, (ProbeOutcome, Option<Vec<Window>>, Instant)> = due
+        .into_iter()
+        .map(|id| {
+            let (outcome, windows) = match probe_live(base_url, &id, creds) {
+                Ok(l) if l.stale => (ProbeOutcome::Stale, Some(l.windows)),
+                Ok(l) => (ProbeOutcome::Fresh, Some(l.windows)),
+                Err(RateLimitError::Unsupported) => (ProbeOutcome::Unsupported, None),
+                Err(e) => {
+                    log::debug!("live usage probe failed for {id}: {e}");
+                    (ProbeOutcome::Failed, None)
+                }
+            };
+            (id, (outcome, windows, Instant::now()))
+        })
+        .collect();
+
+    let log = {
+        let mut log = probes.lock().unwrap();
+        for (id, (outcome, windows, done)) in &live {
+            log.record(id, *outcome, windows.clone(), *done);
+        }
+        log
+    };
+
     let mut result = Vec::new();
     for conn in connections {
-        let (windows, usage_unavailable) = if conn.active {
-            match get(base_url, &format!("/api/usage/{}", conn.id), creds)
-                .and_then(|raw| parse_usage(&raw))
-            {
-                Ok(windows) => (windows, false),
-                Err(_) => (Vec::new(), true),
+        let mut windows = usage.get(&conn.id).map(|u| u.windows.clone());
+        let mut fresh = usage
+            .get(&conn.id)
+            .and_then(|u| u.age_ms)
+            .is_some_and(|age| age >= 0 && (age as u128) < REFRESH_AFTER.as_millis());
+
+        match live.get(&conn.id) {
+            Some((ProbeOutcome::Fresh, Some(w), _)) => {
+                windows = Some(w.clone());
+                fresh = true;
             }
-        } else {
-            (Vec::new(), false)
-        };
+            Some((ProbeOutcome::Stale, Some(w), _)) => {
+                windows = Some(w.clone());
+                fresh = false;
+            }
+            _ => {}
+        }
+        // No cache entry (older OmniRoute, or a failed read): the last numbers a
+        // probe returned stand in, so an account does not blank between probes.
+        if windows.is_none() {
+            windows = log.last_windows(&conn.id).map(<[Window]>::to_vec);
+        }
+        // Confirmed without a usage API: whatever the cache still holds is
+        // obsolete data to drop. (A verdict disproved by a newer entry was
+        // retracted above, before planning.)
+        let unsupported = log.unsupported(&conn.id);
+        if unsupported {
+            windows = Some(Vec::new());
+        }
+
+        // Flagged when the tray's own last look failed AND nothing fresher has
+        // landed in OmniRoute's cache since (the dashboard or the scheduler may
+        // have refreshed it) — a fresh entry is good data whoever fetched it —
+        // or when no source has numbers for this account yet (no usable cache
+        // entry, no probe so far), so the caller carries over its last known
+        // windows instead of reading the gap as "no usage".
+        let no_numbers = windows.is_none();
+        let usage_unavailable =
+            conn.active && !fresh && (log.unavailable(&conn.id) || (no_numbers && !unsupported));
         result.push(AccountLimits {
             id: conn.id,
             account: conn.name,
             provider: conn.provider,
-            windows,
+            windows: if conn.active {
+                windows.unwrap_or_default()
+            } else {
+                Vec::new()
+            },
             active: conn.active,
             usage_unavailable,
         });
     }
     Ok(result)
+}
+
+/// Which active accounts get a live `/api/usage/<id>` this round: those with no
+/// cache entry or one older than `REFRESH_AFTER`, that have not been probed
+/// within `PROBE_GAP` (or, for unsupported ones, `UNSUPPORTED_RECHECK`), at most
+/// `MAX_PROBES_PER_FETCH`. `age_ms` is `None` for an account OmniRoute holds no
+/// entry for — those go first, never-probed ones ahead of the least recently
+/// probed, so that with no cache at all (an older OmniRoute) every account gets
+/// its turn instead of the same three winning each round. Stale entries follow,
+/// oldest first.
+fn plan_probes(
+    candidates: &[(String, Option<i64>)],
+    probes: &ProbeLog,
+    now: Instant,
+) -> Vec<String> {
+    // Sort key, ascending: (0 = missing entry, 1 = stale entry; then how long
+    // since the last probe for missing ones — never probed = longest — or how
+    // stale the entry is for the rest, inverted so oldest sorts first; then id).
+    let mut due: Vec<((u8, i64, i64), &str)> = candidates
+        .iter()
+        .filter(|(id, _)| probes.may_probe(id, now))
+        .filter_map(|(id, age)| match age {
+            None => {
+                let since_probe = probes
+                    .last_attempt(id)
+                    .map_or(i64::MAX, |t| now.duration_since(t).as_millis() as i64);
+                Some(((0, -since_probe, 0), id.as_str()))
+            }
+            Some(age) if *age < 0 || (*age as u128) >= REFRESH_AFTER.as_millis() => {
+                Some(((1, 0, -*age), id.as_str()))
+            }
+            Some(_) => None,
+        })
+        .collect();
+    due.sort();
+    due.truncate(MAX_PROBES_PER_FETCH);
+    due.into_iter().map(|(_, id)| id.to_string()).collect()
+}
+
+struct LiveUsage {
+    windows: Vec<Window>,
+    /// OmniRoute marks a body `_stale` when the provider did not answer and it
+    /// fell back to its previous entry.
+    stale: bool,
+}
+
+fn probe_live(base_url: &str, id: &str, creds: &Credentials) -> Result<LiveUsage, RateLimitError> {
+    let raw = get(base_url, &format!("/api/usage/{id}"), creds, LIVE_TIMEOUT)?;
+    parse_live(&raw)
 }
 
 /// Keep the last good windows for an account whose usage lookup just failed, so a
@@ -101,9 +465,14 @@ pub fn carry_over_windows(previous: &[AccountLimits], fresh: &mut [AccountLimits
     }
 }
 
-fn get(base_url: &str, path: &str, creds: &Credentials) -> Result<String, RateLimitError> {
+fn get(
+    base_url: &str,
+    path: &str,
+    creds: &Credentials,
+    timeout: Duration,
+) -> Result<String, RateLimitError> {
     let url = format!("{base_url}{path}");
-    let req = creds.apply(ureq::get(&url).timeout(std::time::Duration::from_secs(4)));
+    let req = creds.apply(ureq::get(&url).timeout(timeout));
     match req.call() {
         Ok(resp) => resp
             .into_string()
@@ -111,8 +480,77 @@ fn get(base_url: &str, path: &str, creds: &Credentials) -> Result<String, RateLi
         // 401 = no usable credential; 403 = Bearer present but not a management
         // token (an inference-only key with login enabled). Both are auth, not network.
         Err(ureq::Error::Status(code @ (401 | 403), _)) => Err(RateLimitError::Unauthorized(code)),
+        // `/api/usage/<id>` answers 400 "Usage not available for this connection"
+        // for a provider without a usage API. Not a failure to retry — but only
+        // that answer; any other 400 is a failure like the rest.
+        Err(ureq::Error::Status(400, resp)) => {
+            Err(error_for_400(&resp.into_string().unwrap_or_default()))
+        }
         Err(e) => Err(RateLimitError::Network(e.to_string())),
     }
+}
+
+fn error_for_400(body: &str) -> RateLimitError {
+    if body.contains("Usage not available") {
+        RateLimitError::Unsupported
+    } else {
+        let short: String = body.chars().take(200).collect();
+        RateLimitError::Network(format!("HTTP 400: {short}"))
+    }
+}
+
+fn unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// `/api/usage/provider-limits` → `caches: { <connectionId>: { quotas, fetchedAt,
+/// message, ... } }`. Each entry has the same `quotas` shape as `/api/usage/<id>`.
+fn parse_provider_limits(
+    raw: &str,
+) -> Result<HashMap<String, serde_json::Map<String, Value>>, RateLimitError> {
+    let value: Value =
+        serde_json::from_str(raw).map_err(|e| RateLimitError::Parse(e.to_string()))?;
+    let Some(caches) = value.get("caches").and_then(Value::as_object) else {
+        return Err(RateLimitError::Parse(
+            "provider-limits held no `caches` object".to_string(),
+        ));
+    };
+    Ok(caches
+        .iter()
+        .filter_map(|(id, entry)| entry.as_object().map(|e| (id.clone(), e.clone())))
+        .collect())
+}
+
+/// OmniRoute persists an error-only entry (`quotas: null` plus a `message`) when a
+/// refresh failed and there was no earlier good entry to keep. That is a failed
+/// lookup, not an account without usage: treat it as no entry, so it gets probed
+/// and, failing that, flagged. A `quotas: null` with no message is a real answer.
+fn is_error_only_entry(entry: &serde_json::Map<String, Value>) -> bool {
+    let has_quotas = entry.get("quotas").is_some_and(Value::is_object);
+    let has_message = entry
+        .get("message")
+        .and_then(Value::as_str)
+        .is_some_and(|m| !m.trim().is_empty());
+    !has_quotas && has_message
+}
+
+/// Whether a cache entry `age_ms` old was written after a verdict reached
+/// `since_verdict` ago. `None` age (no usable entry, or no readable `fetchedAt`)
+/// never postdates anything; `None` verdict means there is nothing to supersede.
+fn entry_postdates_verdict(age_ms: Option<i64>, since_verdict: Option<Duration>) -> bool {
+    match (age_ms, since_verdict) {
+        (Some(age), Some(since)) => age >= 0 && (age as u128) < since.as_millis(),
+        _ => false,
+    }
+}
+
+/// Milliseconds since the entry's `fetchedAt`; `None` when it carries none we can read.
+fn entry_age_ms(entry: &serde_json::Map<String, Value>, now_ms: i64) -> Option<i64> {
+    let fetched = entry.get("fetchedAt").and_then(Value::as_str)?;
+    Some(now_ms - chrono_parse_millis(fetched)?)
 }
 
 fn parse_connections(raw: &str) -> Result<Vec<Connection>, RateLimitError> {
@@ -173,7 +611,9 @@ fn parse_connections(raw: &str) -> Result<Vec<Connection>, RateLimitError> {
     Ok(connections)
 }
 
-pub fn parse_usage(raw: &str) -> Result<Vec<Window>, RateLimitError> {
+/// A live `/api/usage/<id>` answer: its windows, and whether OmniRoute marked the
+/// body `_stale` (the provider did not answer and it served its previous entry).
+fn parse_live(raw: &str) -> Result<LiveUsage, RateLimitError> {
     let value: Value =
         serde_json::from_str(raw).map_err(|e| RateLimitError::Parse(e.to_string()))?;
     // A usage body is an object; `[]`, `null` or a string would otherwise slip
@@ -183,6 +623,30 @@ pub fn parse_usage(raw: &str) -> Result<Vec<Window>, RateLimitError> {
             "usage response was not an object".to_string(),
         ));
     };
+    // A 200 with `quotas: null` and a `message` is how OmniRoute reports a failed
+    // provider lookup when it has no earlier entry to fall back on. Same rule as
+    // for cached entries: that is a failed probe, not an account with no usage.
+    if is_error_only_entry(body) {
+        let message = body
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("provider lookup failed");
+        return Err(RateLimitError::Network(format!("OmniRoute: {message}")));
+    }
+    Ok(LiveUsage {
+        windows: windows_from_body(body)?,
+        stale: body.get("_stale").and_then(Value::as_bool).unwrap_or(false),
+    })
+}
+
+#[cfg(test)]
+fn parse_usage(raw: &str) -> Result<Vec<Window>, RateLimitError> {
+    parse_live(raw).map(|live| live.windows)
+}
+
+/// The windows in a usage body — a live `/api/usage/<id>` answer or one entry of
+/// the `/api/usage/provider-limits` cache; both carry the same `quotas` object.
+fn windows_from_body(body: &serde_json::Map<String, Value>) -> Result<Vec<Window>, RateLimitError> {
     // Absent (or null) quotas is an answer: this account has none. Any other type
     // is a broken response, and must not be reported as "no usage" (#57).
     let quotas = match body.get("quotas") {
@@ -345,7 +809,15 @@ fn minutes_until(reset: &str) -> Option<i64> {
     Some((ts - now) / 60_000)
 }
 
+/// Unix milliseconds for an ISO-8601 timestamp. RFC 3339 input (what OmniRoute
+/// writes, e.g. `2026-09-18T15:34:45.854Z`) keeps its fractional seconds and
+/// offset — `entry_postdates_verdict` orders a cache entry against a probe that
+/// may have completed in the same second, so whole seconds are not enough. The
+/// hand parser below stays as a fallback for date-only or offset-less shapes.
 fn chrono_parse_millis(iso: &str) -> Option<i64> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(iso) {
+        return Some(dt.timestamp_millis());
+    }
     let date = &iso.get(0..10)?;
     let time = iso.get(11..19).unwrap_or("00:00:00");
     let (y, m, d) = (
@@ -662,5 +1134,415 @@ mod tests {
     fn entries_we_cannot_read_at_all_are_an_error_not_an_empty_list() {
         let unreadable = r#"{"connections":[{"name":"no id"},{"name":"no provider"}]}"#;
         assert!(parse_connections(unreadable).is_err());
+    }
+
+    // Shape of `/api/usage/provider-limits` as served by v3.8.51: one cache entry
+    // per connection id, each with the same `quotas` object `/api/usage/<id>` returns.
+    const PROVIDER_LIMITS: &str = r#"{
+      "caches": {
+        "claude-1": {
+          "quotas": {
+            "session (5h)": {"used":27,"total":100,"remaining":73,"resetAt":"2026-07-05T16:40:00Z","remainingPercentage":73,"unlimited":false},
+            "weekly (7d)": {"used":10,"total":100,"remaining":90,"resetAt":"2026-07-08T07:00:00Z","remainingPercentage":90,"unlimited":false}
+          },
+          "plan": "default_raven", "message": null,
+          "fetchedAt": "2026-09-18T15:34:45.854Z", "source": "manual"
+        },
+        "codex-1": {"quotas": null, "plan": null, "message": "rate limited", "fetchedAt": "2026-09-18T15:00:00.000Z"}
+      },
+      "intervalMinutes": 70,
+      "lastAutoSyncAt": "2026-09-18T14:27:50.043Z"
+    }"#;
+
+    #[test]
+    fn cache_entry_yields_the_same_windows_as_a_live_answer() {
+        let caches = parse_provider_limits(PROVIDER_LIMITS).unwrap();
+        let cached = windows_from_body(&caches["claude-1"]).unwrap();
+        let live = parse_usage(USAGE).unwrap();
+        assert_eq!(cached, live);
+        assert!(
+            windows_from_body(&caches["codex-1"]).unwrap().is_empty(),
+            "an error-only entry is an account with no windows, not a parse error"
+        );
+    }
+
+    #[test]
+    fn provider_limits_without_caches_is_an_error() {
+        assert!(parse_provider_limits(r#"{"error":"nope"}"#).is_err());
+        assert!(parse_provider_limits(r#"[]"#).is_err());
+        assert!(parse_provider_limits(r#"{"caches":{}}"#)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn timestamps_keep_their_milliseconds() {
+        let whole = chrono_parse_millis("2026-09-18T15:34:45Z").unwrap();
+        assert_eq!(
+            chrono_parse_millis("2026-09-18T15:34:45.854Z"),
+            Some(whole + 854),
+            "the fraction OmniRoute writes must survive, or same-second ordering breaks"
+        );
+        assert_eq!(
+            chrono_parse_millis("2026-09-18T17:34:45.854+02:00"),
+            Some(whole + 854),
+            "offsets are honoured"
+        );
+        assert_eq!(whole % 1000, 0);
+        assert!(
+            chrono_parse_millis("2026-09-18").is_some(),
+            "date-only input still parses through the fallback"
+        );
+    }
+
+    #[test]
+    fn entry_age_comes_from_fetched_at() {
+        let caches = parse_provider_limits(PROVIDER_LIMITS).unwrap();
+        // The fixture's `fetchedAt` carries a fraction; the age must be exact.
+        let fetched = chrono_parse_millis("2026-09-18T15:34:45.854Z").unwrap();
+        assert_eq!(
+            entry_age_ms(&caches["claude-1"], fetched + 30_000),
+            Some(30_000)
+        );
+        let bare = serde_json::Map::new();
+        assert_eq!(entry_age_ms(&bare, fetched), None);
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[test]
+    fn probes_go_to_missing_then_stalest_entries_capped_per_fetch() {
+        let now = Instant::now();
+        let log = ProbeLog::default();
+        let refresh = REFRESH_AFTER.as_millis() as i64;
+        let candidates = vec![
+            ("fresh".to_string(), Some(refresh / 2)),
+            ("stale".to_string(), Some(refresh + 1_000)),
+            ("staler".to_string(), Some(refresh + 60_000)),
+            ("never".to_string(), None),
+            ("clock-skew".to_string(), Some(-5_000)),
+        ];
+        let due = plan_probes(&candidates, &log, now);
+        assert_eq!(due.len(), MAX_PROBES_PER_FETCH);
+        assert_eq!(due[0], "never", "no entry at all is the most overdue");
+        assert_eq!(due[1], "staler");
+        assert_eq!(due[2], "stale");
+        assert!(!due.contains(&"fresh".to_string()));
+    }
+
+    #[test]
+    fn with_no_cache_at_all_every_account_gets_its_turn() {
+        // An older OmniRoute: no entry for anyone. Round one takes three; after
+        // the gap, round two must start with the two that were skipped, not the
+        // same three again (the closed-popover refresh is the only caller then).
+        let t0 = Instant::now();
+        let mut log = ProbeLog::default();
+        let candidates: Vec<(String, Option<i64>)> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|id| (id.to_string(), None))
+            .collect();
+        let round1 = plan_probes(&candidates, &log, t0);
+        assert_eq!(round1, vec!["a", "b", "c"]);
+        for id in &round1 {
+            log.record(id, ProbeOutcome::Failed, None, t0);
+        }
+        let round2 = plan_probes(&candidates, &log, t0 + PROBE_GAP * 5);
+        assert_eq!(round2[..2], ["d", "e"], "never probed go first");
+        assert_eq!(round2[2], "a", "then the least recently probed");
+        for id in &round2 {
+            log.record(id, ProbeOutcome::Failed, None, t0 + PROBE_GAP * 5);
+        }
+        let round3 = plan_probes(&candidates, &log, t0 + PROBE_GAP * 10);
+        assert_eq!(
+            round3,
+            vec!["b", "c", "a"],
+            "b and c are the oldest; a, d and e tie on time and the id decides"
+        );
+    }
+
+    #[test]
+    fn a_failed_probe_is_not_retried_until_the_gap_has_passed() {
+        let t0 = Instant::now();
+        let mut log = ProbeLog::default();
+        let candidates = vec![("a".to_string(), None)];
+        assert_eq!(plan_probes(&candidates, &log, t0), vec!["a".to_string()]);
+        log.record("a", ProbeOutcome::Failed, None, t0);
+        assert!(log.unavailable("a"));
+        assert!(
+            plan_probes(&candidates, &log, t0 + secs(5)).is_empty(),
+            "the next 5s poll waits"
+        );
+        assert_eq!(
+            plan_probes(&candidates, &log, t0 + PROBE_GAP),
+            vec!["a".to_string()]
+        );
+        log.record("a", ProbeOutcome::Fresh, None, t0 + PROBE_GAP);
+        assert!(!log.unavailable("a"), "a success clears the flag");
+    }
+
+    #[test]
+    fn unsupported_connections_are_rechecked_rarely_and_not_flagged() {
+        let t0 = Instant::now();
+        let mut log = ProbeLog::default();
+        log.record("api", ProbeOutcome::Unsupported, None, t0);
+        assert!(log.unsupported("api"));
+        assert!(
+            !log.unavailable("api"),
+            "no usage API is an answer, not an outage"
+        );
+        let candidates = vec![("api".to_string(), None)];
+        assert!(plan_probes(&candidates, &log, t0 + PROBE_GAP * 10).is_empty());
+        assert_eq!(
+            plan_probes(&candidates, &log, t0 + UNSUPPORTED_RECHECK),
+            vec!["api".to_string()]
+        );
+    }
+
+    #[test]
+    fn stale_marker_on_a_live_answer_is_read() {
+        let raw = USAGE.trim_end().trim_end_matches('}').to_string()
+            + r#","_stale":true,"_staleReason":"rate limited"}"#;
+        let live = parse_live(&raw).unwrap();
+        assert!(live.stale);
+        assert_eq!(live.windows.len(), 2, "stale numbers are still numbers");
+        assert!(!parse_live(USAGE).unwrap().stale);
+    }
+
+    #[test]
+    fn an_error_only_live_body_is_a_failed_probe_not_empty_usage() {
+        let raw = r#"{"quotas":null,"plan":null,"message":"Claude connected. Usage API requires admin permissions."}"#;
+        assert!(
+            matches!(parse_live(raw), Err(RateLimitError::Network(m)) if m.contains("admin permissions")),
+            "a 200 carrying only an error message must not read as \"no usage\""
+        );
+        let no_quotas_no_message = r#"{"quotas":null,"plan":null,"message":null}"#;
+        let live = parse_live(no_quotas_no_message).unwrap();
+        assert!(
+            live.windows.is_empty(),
+            "no quotas and no message is a real empty answer"
+        );
+    }
+
+    #[test]
+    fn a_stale_server_answer_counts_as_not_fresh() {
+        let mut log = ProbeLog::default();
+        log.record("a", ProbeOutcome::Stale, None, Instant::now());
+        assert!(log.unavailable("a"));
+    }
+
+    /// End to end against a running OmniRoute: the cached map answers every poll,
+    /// live probes go only to stale/missing entries, and a second fetch right after
+    /// the first probes nothing (so it only touches the local database).
+    #[test]
+    #[ignore = "live test: requires a running OmniRoute on OMNIROUTE_LIVE_PORT and a credential in OMNIROUTE_LIVE_CLI_TOKEN or OMNIROUTE_LIVE_API_KEY"]
+    fn live_fetch_reads_the_cache_and_throttles_probes() {
+        let port = std::env::var("OMNIROUTE_LIVE_PORT").expect("OMNIROUTE_LIVE_PORT");
+        let base = format!("http://127.0.0.1:{port}");
+        // Credentials come from the environment, never from `~/.omniroute/.env`
+        // (a test must not read that file). The loopback token is
+        // `printf omniroute-cli-auth-v1 | openssl dgst -sha256 -hmac <IOPlatformUUID, lower-cased>`.
+        let creds = Credentials {
+            api_key: std::env::var("OMNIROUTE_LIVE_API_KEY").ok(),
+            cli_token: std::env::var("OMNIROUTE_LIVE_CLI_TOKEN").ok(),
+        };
+        assert!(
+            !creds.is_empty(),
+            "set OMNIROUTE_LIVE_CLI_TOKEN or OMNIROUTE_LIVE_API_KEY"
+        );
+        let probes = Mutex::new(ProbeLog::default());
+
+        let t = Instant::now();
+        let first = fetch(&base, &creds, &probes).expect("first fetch");
+        let first_ms = t.elapsed().as_millis();
+        assert!(!first.is_empty(), "the reference instance has accounts");
+        for a in &first {
+            // Provider + id prefix only: the account name is often an e-mail address.
+            eprintln!(
+                "{:<8} {:<14} active={} windows={} unavailable={}",
+                &a.id[..a.id.len().min(8)],
+                a.provider,
+                a.active,
+                a.windows.len(),
+                a.usage_unavailable
+            );
+        }
+        let recorded = probes.lock().unwrap().entries.len();
+        eprintln!("first fetch: {first_ms}ms, probes recorded: {recorded}");
+        assert!(recorded <= MAX_PROBES_PER_FETCH);
+
+        let t = Instant::now();
+        let second = fetch(&base, &creds, &probes).expect("second fetch");
+        let second_ms = t.elapsed().as_millis();
+        let recorded = probes.lock().unwrap().entries.len();
+        eprintln!("second fetch: {second_ms}ms, probes recorded: {recorded}");
+        assert_eq!(first.len(), second.len());
+        assert!(
+            second_ms < 2_000,
+            "a follow-up poll must not wait on upstream providers ({second_ms}ms)"
+        );
+    }
+
+    #[test]
+    fn last_live_numbers_survive_a_failed_probe_and_go_with_an_unsupported_one() {
+        let now = Instant::now();
+        let mut log = ProbeLog::default();
+        let windows = account("claude", 2, false).windows;
+        log.record("a", ProbeOutcome::Fresh, Some(windows.clone()), now);
+        assert_eq!(log.last_windows("a"), Some(windows.as_slice()));
+        log.record("a", ProbeOutcome::Failed, None, now + PROBE_GAP);
+        assert_eq!(
+            log.last_windows("a"),
+            Some(windows.as_slice()),
+            "a failure keeps the last numbers for the polls in between"
+        );
+        assert!(log.unavailable("a"));
+        log.record("a", ProbeOutcome::Unsupported, None, now + PROBE_GAP * 2);
+        assert_eq!(
+            log.last_windows("a"),
+            None,
+            "no usage API: old bars are obsolete"
+        );
+    }
+
+    #[test]
+    fn a_reserved_probe_blocks_an_overlapping_fetch_without_flagging_the_account() {
+        let now = Instant::now();
+        let mut log = ProbeLog::default();
+        let windows = account("claude", 1, false).windows;
+        log.record("a", ProbeOutcome::Fresh, Some(windows.clone()), now);
+        log.reserve(&["a".to_string(), "b".to_string()], now + PROBE_GAP);
+        assert!(!log.may_probe("a", now + PROBE_GAP + secs(5)));
+        assert!(!log.may_probe("b", now + PROBE_GAP + secs(5)));
+        assert!(!log.unavailable("a"), "in flight is not a failure");
+        assert_eq!(
+            log.last_windows("a"),
+            Some(windows.as_slice()),
+            "reserving keeps the numbers"
+        );
+        assert!(
+            log.may_probe("a", now + PROBE_GAP * 2),
+            "an abandoned reservation expires"
+        );
+    }
+
+    #[test]
+    fn an_error_only_cache_entry_is_not_an_answer() {
+        let caches = parse_provider_limits(PROVIDER_LIMITS).unwrap();
+        assert!(!is_error_only_entry(&caches["claude-1"]));
+        assert!(
+            is_error_only_entry(&caches["codex-1"]),
+            "quotas null + message = a failed refresh OmniRoute persisted, not \"no usage\""
+        );
+        let no_quotas: serde_json::Map<String, Value> = serde_json::from_str(
+            r#"{"quotas":null,"message":null,"fetchedAt":"2026-09-18T15:00:00Z"}"#,
+        )
+        .unwrap();
+        assert!(
+            !is_error_only_entry(&no_quotas),
+            "no quotas and no message is a real answer"
+        );
+    }
+
+    #[test]
+    fn a_reservation_does_not_erase_the_last_outcome() {
+        let now = Instant::now();
+        let mut log = ProbeLog::default();
+        log.record("f", ProbeOutcome::Failed, None, now);
+        log.record("u", ProbeOutcome::Unsupported, None, now);
+        log.reserve(&["f".to_string()], now + PROBE_GAP);
+        assert!(
+            log.unavailable("f"),
+            "still flagged while the retry is in flight"
+        );
+        assert!(!log.may_probe("f", now + PROBE_GAP + secs(1)));
+        log.record(
+            "f",
+            ProbeOutcome::Fresh,
+            Some(Vec::new()),
+            now + PROBE_GAP + secs(2),
+        );
+        assert!(!log.unavailable("f"), "the completed retry clears it");
+        assert!(log.unsupported("u"), "untouched accounts keep theirs");
+    }
+
+    #[test]
+    fn only_a_cache_entry_newer_than_the_unsupported_verdict_supersedes_it() {
+        let since = Some(secs(600));
+        assert!(
+            entry_postdates_verdict(Some(30_000), since),
+            "written 30s ago, verdict 10min ago: the usage API works now"
+        );
+        assert!(
+            !entry_postdates_verdict(Some(3_600_000), since),
+            "an hour-old entry is the obsolete data the verdict is about"
+        );
+        assert!(!entry_postdates_verdict(None, since), "no usable entry");
+        assert!(
+            !entry_postdates_verdict(Some(30_000), None),
+            "no verdict: nothing to supersede (and nothing to clear)"
+        );
+        assert!(
+            !entry_postdates_verdict(Some(-5_000), since),
+            "clock skew is not freshness"
+        );
+    }
+
+    #[test]
+    fn a_disproved_unsupported_verdict_returns_the_account_to_the_normal_gap() {
+        let t0 = Instant::now();
+        let mut log = ProbeLog::default();
+        log.record("u", ProbeOutcome::Unsupported, None, t0);
+        let later = t0 + secs(600);
+        // OmniRoute wrote a usable entry 30s ago, well after the verdict.
+        let candidates = vec![("u".to_string(), Some(30_000))];
+        assert!(
+            entry_postdates_verdict(Some(30_000), Some(later.duration_since(t0))),
+            "the entry disproves the verdict"
+        );
+        assert!(
+            plan_probes(&candidates, &log, later).is_empty(),
+            "still fresh: nothing to probe yet"
+        );
+        log.retract_unsupported("u");
+        assert!(
+            !log.unsupported("u"),
+            "no longer rendered as having no usage API"
+        );
+        let stale = vec![("u".to_string(), Some(REFRESH_AFTER.as_millis() as i64 + 1))];
+        assert_eq!(
+            plan_probes(&stale, &log, later),
+            vec!["u".to_string()],
+            "once the entry ages past REFRESH_AFTER it is refreshed under the normal gap, not the hour"
+        );
+        // Retracting anything else is a no-op.
+        log.record("f", ProbeOutcome::Failed, None, t0);
+        log.retract_unsupported("f");
+        assert!(log.unavailable("f"));
+    }
+
+    #[test]
+    fn only_the_documented_400_means_unsupported() {
+        assert!(matches!(
+            error_for_400(r#"{"error":"Usage not available for this connection"}"#),
+            RateLimitError::Unsupported
+        ));
+        assert!(matches!(
+            error_for_400(r#"{"error":"connectionId is required"}"#),
+            RateLimitError::Network(_)
+        ));
+        assert!(matches!(error_for_400(""), RateLimitError::Network(_)));
+    }
+
+    #[test]
+    fn probe_log_forgets_connections_no_longer_reported() {
+        let mut log = ProbeLog::default();
+        let now = Instant::now();
+        log.record("gone", ProbeOutcome::Failed, None, now);
+        log.record("kept", ProbeOutcome::Failed, None, now);
+        log.retain(&["kept".to_string()]);
+        assert!(!log.unavailable("gone"));
+        assert!(log.unavailable("kept"));
     }
 }
