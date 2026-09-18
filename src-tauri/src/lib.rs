@@ -910,7 +910,13 @@ pub fn run() {
                     std::thread::spawn(move || restart_flow(handle));
                 }
                 "doctor" => {
-                    if let Some(window) = app.get_webview_window(POPOVER_LABEL) {
+                    // Same recovery as `toggle_popover`: the popover may be
+                    // missing, now that it is built at runtime rather than by
+                    // the config, and Doctor with no window would do nothing.
+                    if let Some(window) = app
+                        .get_webview_window(POPOVER_LABEL)
+                        .or_else(|| recreate_popover(app))
+                    {
                         app.state::<AppState>()
                             .pin_open
                             .store(true, std::sync::atomic::Ordering::SeqCst);
