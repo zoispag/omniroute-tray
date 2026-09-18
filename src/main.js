@@ -61,8 +61,9 @@ async function refresh() {
     if (inSettings) {
       // This 5s loop is the only thing still running while Settings is open; the
       // server-side quota thread first fires 5 minutes in, which is no way to
-      // recover a Settings page whose own fetch failed.
-      if (settingsNeedsAccounts) await fillSettingsAccounts();
+      // recover a Settings page whose own fetch failed. Only until a fetch lands:
+      // an empty answer is settled, and retrying it forever buys nothing.
+      if (settingsNeedsAccounts && !rateLimitsLoaded) await fillSettingsAccounts();
       return;
     }
     renderUpdate(status);
@@ -108,6 +109,9 @@ async function toggleSettings() {
         rateLimitCache = await invoke("get_rate_limits");
         rateLimitsLoaded = true;
       } catch {}
+      // Settings may have been closed while that was in flight; the main view is
+      // already rebuilt and clearSections() below would blank it.
+      if (!inSettings) return;
     }
     document.getElementById("update").innerHTML = "";
     clearSections();
@@ -123,7 +127,9 @@ async function toggleSettings() {
   fitWindow();
 }
 
-// Retry the accounts behind an empty Settings page until one lands.
+// Fetch the accounts behind an empty Settings page. Runs off the 5s poll until a
+// fetch lands; `settingsNeedsAccounts` stays set so a later `quota-refreshed` with
+// real accounts can still fill the page in.
 async function fillSettingsAccounts() {
   let data;
   try {
