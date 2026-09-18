@@ -8,6 +8,10 @@ use crate::omniauth::Credentials;
 pub enum RateLimitError {
     #[error("network error: {0}")]
     Network(String),
+    /// No API key resolved yet — normal for the seconds between a fresh install's
+    /// first server start and its first minted key. Not an empty account list.
+    #[error("waiting for OmniRoute credentials")]
+    NoCredentials,
     #[error("OmniRoute rejected the tray's credentials (HTTP {0})")]
     Unauthorized(u16),
     #[error("parse error: {0}")]

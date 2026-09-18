@@ -543,7 +543,9 @@ async fn get_rate_limits(
     let fetched = tauri::async_runtime::spawn_blocking(move || {
         let creds = credentials_for_request(&app);
         if creds.is_empty() {
-            return Ok(Vec::new());
+            // An empty list would read as "this install has no accounts"; the
+            // popover must show it as unavailable and keep any cached rows.
+            return Err(ratelimits::RateLimitError::NoCredentials);
         }
         ratelimits::fetch(SERVER_URL, &creds)
     })
