@@ -809,7 +809,15 @@ fn minutes_until(reset: &str) -> Option<i64> {
     Some((ts - now) / 60_000)
 }
 
+/// Unix milliseconds for an ISO-8601 timestamp. RFC 3339 input (what OmniRoute
+/// writes, e.g. `2026-09-18T15:34:45.854Z`) keeps its fractional seconds and
+/// offset — `entry_postdates_verdict` orders a cache entry against a probe that
+/// may have completed in the same second, so whole seconds are not enough. The
+/// hand parser below stays as a fallback for date-only or offset-less shapes.
 fn chrono_parse_millis(iso: &str) -> Option<i64> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(iso) {
+        return Some(dt.timestamp_millis());
+    }
     let date = &iso.get(0..10)?;
     let time = iso.get(11..19).unwrap_or("00:00:00");
     let (y, m, d) = (
@@ -1165,6 +1173,26 @@ mod tests {
         assert!(parse_provider_limits(r#"{"caches":{}}"#)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn timestamps_keep_their_milliseconds() {
+        let whole = chrono_parse_millis("2026-09-18T15:34:45Z").unwrap();
+        assert_eq!(
+            chrono_parse_millis("2026-09-18T15:34:45.854Z"),
+            Some(whole + 854),
+            "the fraction OmniRoute writes must survive, or same-second ordering breaks"
+        );
+        assert_eq!(
+            chrono_parse_millis("2026-09-18T17:34:45.854+02:00"),
+            Some(whole + 854),
+            "offsets are honoured"
+        );
+        assert_eq!(whole % 1000, 0);
+        assert!(
+            chrono_parse_millis("2026-09-18").is_some(),
+            "date-only input still parses through the fallback"
+        );
     }
 
     #[test]
