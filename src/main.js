@@ -106,9 +106,9 @@ async function toggleSettings() {
   settingsTouched = false;
   if (inSettings) {
     if (!rateLimitCache.length) {
+      const epoch = accountsEpoch;
       try {
-        rateLimitCache = await invoke("get_rate_limits");
-        rateLimitsLoaded = true;
+        acceptAccounts(await invoke("get_rate_limits"), epoch);
       } catch {}
       // Settings may have been closed while that was in flight; the main view is
       // already rebuilt and clearSections() below would blank it.
@@ -132,18 +132,16 @@ async function toggleSettings() {
 // fetch lands; `settingsNeedsAccounts` stays set so a later `quota-refreshed` with
 // real accounts can still fill the page in.
 async function fillSettingsAccounts() {
+  const epoch = accountsEpoch;
   let data;
   try {
     data = await invoke("get_rate_limits");
   } catch {
     return; // still unavailable; the next tick tries again
   }
-  if (!Array.isArray(data)) return;
-  rateLimitsLoaded = true;
-  if (!data.length) return;
   // Keep what we fetched whatever the view is doing — only the repaint is guarded,
   // or the main view would go back to claiming there are no accounts.
-  rateLimitCache = data;
+  if (!acceptAccounts(data, epoch) || !data.length) return;
   if (!inSettings || settingsTouched) return;
   await renderSettings({ automatic: true });
 }
@@ -361,6 +359,20 @@ let rateLimitCache = [];
 // The skeleton stands for "not fetched yet". Once a fetch has landed, an empty list
 // is an answer — OmniRoute has no connections — and must not keep faking a load.
 let rateLimitsLoaded = false;
+// Bumped by every accepted account payload. A fetch captures it before awaiting and
+// drops its answer if anything landed meanwhile, so an older response — a second
+// Settings visit, a poll crossing a `quota-refreshed` — cannot overwrite newer
+// accounts or repaint the page from them.
+let accountsEpoch = 0;
+
+function acceptAccounts(data, epoch) {
+  if (!Array.isArray(data)) return false;
+  rateLimitsLoaded = true;
+  if (epoch !== accountsEpoch) return false;
+  rateLimitCache = data;
+  accountsEpoch += 1;
+  return true;
+}
 
 // ---- provider marks ----
 // Beyond the few marks bundled in icons.js, the local OmniRoute dashboard serves
@@ -784,12 +796,9 @@ async function renderRateLimits() {
   if (!rateLimitCache.length && !rateLimitsLoaded) {
     section.innerHTML = usageSkeleton();
   }
+  const epoch = accountsEpoch;
   try {
-    const data = await invoke("get_rate_limits");
-    if (Array.isArray(data)) {
-      rateLimitCache = data;
-      rateLimitsLoaded = true;
-    }
+    acceptAccounts(await invoke("get_rate_limits"), epoch);
     // The cache is always worth updating; the DOM below may be gone by now.
     if (!document.getElementById("ratelimits")) return;
   } catch (err) {
@@ -1448,6 +1457,7 @@ getCurrentWindow().listen("quota-refreshed", (event) => {
   if (Array.isArray(event.payload)) {
     rateLimitCache = event.payload;
     rateLimitsLoaded = true;
+    accountsEpoch += 1; // supersedes anything currently in flight
   }
   if (!inSettings) {
     paintRateLimits();
