@@ -176,9 +176,16 @@ fn parse_connections(raw: &str) -> Result<Vec<Connection>, RateLimitError> {
 pub fn parse_usage(raw: &str) -> Result<Vec<Window>, RateLimitError> {
     let value: Value =
         serde_json::from_str(raw).map_err(|e| RateLimitError::Parse(e.to_string()))?;
+    // A usage body is an object; `[]`, `null` or a string would otherwise slip
+    // through `get("quotas")` as None and be read as "this account has no quotas".
+    let Some(body) = value.as_object() else {
+        return Err(RateLimitError::Parse(
+            "usage response was not an object".to_string(),
+        ));
+    };
     // Absent (or null) quotas is an answer: this account has none. Any other type
     // is a broken response, and must not be reported as "no usage" (#57).
-    let quotas = match value.get("quotas") {
+    let quotas = match body.get("quotas") {
         Some(Value::Object(q)) => q,
         None | Some(Value::Null) => return Ok(Vec::new()),
         Some(_) => {
@@ -192,6 +199,13 @@ pub fn parse_usage(raw: &str) -> Result<Vec<Window>, RateLimitError> {
     for (key, q) in quotas {
         if !is_time_window(key) {
             continue;
+        }
+        // A window we cannot read is not a window at 0% — that would paint a full
+        // bar over the account's last known numbers.
+        if !q.is_object() {
+            return Err(RateLimitError::Parse(format!(
+                "quota `{key}` is not an object"
+            )));
         }
         let unlimited = q.get("unlimited").and_then(Value::as_bool).unwrap_or(false);
         windows.push(Window {
@@ -428,6 +442,23 @@ mod tests {
     fn malformed_quotas_is_an_error_not_an_idle_account() {
         assert!(parse_usage(r#"{"quotas":[]}"#).is_err());
         assert!(parse_usage(r#"{"quotas":"none"}"#).is_err());
+    }
+
+    #[test]
+    fn usage_body_must_be_an_object() {
+        for raw in ["[]", "null", r#""nope""#, "7"] {
+            assert!(parse_usage(raw).is_err(), "accepted {raw}");
+        }
+    }
+
+    #[test]
+    fn unreadable_window_is_an_error_not_a_zero_percent_bar() {
+        assert!(parse_usage(r#"{"quotas":{"session (5h)":null}}"#).is_err());
+        assert!(parse_usage(r#"{"quotas":{"weekly (7d)":"full"}}"#).is_err());
+        assert!(
+            parse_usage(r#"{"quotas":{"gemini-2.5-flash":null}}"#).is_ok(),
+            "per-model keys are filtered out before we look at them"
+        );
     }
 
     #[test]
