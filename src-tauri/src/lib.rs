@@ -53,8 +53,10 @@ struct AppState {
     /// When the tray last asked OmniRoute for a LIVE usage lookup of each account,
     /// and how that went. `ratelimits::fetch` reads the cached provider-limits map
     /// and only probes live for stale or missing entries, no more than once a
-    /// minute per account (#61). Held across the whole fetch, so the 5s poll and
-    /// the background refresh never probe the same account at once.
+    /// minute per account (#61). Locked only to plan and to record probes, never
+    /// across a request, so the 5s poll never queues behind the background
+    /// refresh; a planned probe is reserved so the two never probe one account
+    /// at once.
     usage_probes: Mutex<ratelimits::ProbeLog>,
     /// Provider marks fetched from the server's `/providers/<id>.svg`, keyed by
     /// provider id and valid for one served OmniRoute version. `None` records that
@@ -388,11 +390,7 @@ fn schedule_quota_refresh(app: tauri::AppHandle) {
         if creds.is_empty() {
             continue;
         }
-        let fetched = {
-            let mut probes = app_state.usage_probes.lock().unwrap();
-            ratelimits::fetch(SERVER_URL, &creds, &mut probes)
-        };
-        let Ok(mut limits) = fetched else {
+        let Ok(mut limits) = ratelimits::fetch(SERVER_URL, &creds, &app_state.usage_probes) else {
             continue;
         };
         {
@@ -580,8 +578,7 @@ async fn get_rate_limits(
             return Err(ratelimits::RateLimitError::NoCredentials);
         }
         let state = app.state::<AppState>();
-        let mut probes = state.usage_probes.lock().unwrap();
-        ratelimits::fetch(SERVER_URL, &creds, &mut probes)
+        ratelimits::fetch(SERVER_URL, &creds, &state.usage_probes)
     })
     .await
     .map_err(|e| e.to_string())?;

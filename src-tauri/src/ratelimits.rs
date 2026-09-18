@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -82,29 +83,36 @@ struct Connection {
 
 /// What the tray remembers about its own live probes, per connection id. Lives in
 /// `AppState` and outlives a single `fetch`, so a failed upstream lookup is not
-/// retried on the very next poll, and its outcome keeps labelling the account
-/// until a later probe succeeds.
+/// retried on the very next poll, its outcome keeps labelling the account until
+/// a later probe succeeds, and the numbers a probe returned stay available to the
+/// polls in between (an older OmniRoute without the cache endpoint has no other
+/// source for them). Locked only to plan and to record probes, never across I/O.
 #[derive(Debug, Default)]
 pub struct ProbeLog {
     entries: HashMap<String, Probe>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct Probe {
     at: Instant,
     outcome: ProbeOutcome,
+    /// Windows from the last probe that returned numbers, kept across failures
+    /// and dropped once the provider is confirmed to have no usage API.
+    windows: Option<Vec<Window>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ProbeOutcome {
+    /// Reserved by a fetch that is about to probe it off the lock.
+    Pending,
     /// `/api/usage/<id>` returned fresh numbers.
     Fresh,
     /// OmniRoute could not reach the provider and served its own previous entry
     /// (`_stale: true`). Numbers exist, but they are not the latest.
     Stale,
-    /// Network error, timeout, or a non-2xx answer other than 400.
+    /// Network error, timeout, or a non-2xx answer other than the 400 below.
     Failed,
-    /// HTTP 400: this provider has no usage API.
+    /// HTTP 400 "Usage not available for this connection": no usage API.
     Unsupported,
 }
 
@@ -122,9 +130,45 @@ impl ProbeLog {
         }
     }
 
-    fn record(&mut self, id: &str, outcome: ProbeOutcome, now: Instant) {
-        self.entries
-            .insert(id.to_string(), Probe { at: now, outcome });
+    /// Claim `ids` for a probe that is about to run without the lock, so an
+    /// overlapping fetch does not probe the same accounts. The previous outcome's
+    /// numbers are kept; only the timestamp and the in-flight marker change.
+    fn reserve(&mut self, ids: &[String], now: Instant) {
+        for id in ids {
+            let entry = self.entries.entry(id.clone()).or_insert(Probe {
+                at: now,
+                outcome: ProbeOutcome::Pending,
+                windows: None,
+            });
+            entry.at = now;
+            entry.outcome = ProbeOutcome::Pending;
+        }
+    }
+
+    /// `windows` is `Some` only for a probe that returned numbers; a failure keeps
+    /// the last ones, an unsupported answer drops them (they are obsolete).
+    fn record(
+        &mut self,
+        id: &str,
+        outcome: ProbeOutcome,
+        windows: Option<Vec<Window>>,
+        now: Instant,
+    ) {
+        let entry = self.entries.entry(id.to_string()).or_insert(Probe {
+            at: now,
+            outcome,
+            windows: None,
+        });
+        entry.at = now;
+        entry.outcome = outcome;
+        match outcome {
+            ProbeOutcome::Unsupported => entry.windows = None,
+            _ => {
+                if windows.is_some() {
+                    entry.windows = windows;
+                }
+            }
+        }
     }
 
     /// The last probe did not produce fresh numbers.
@@ -135,12 +179,16 @@ impl ProbeLog {
         )
     }
 
-    #[cfg(test)]
     fn unsupported(&self, id: &str) -> bool {
         matches!(
             self.entries.get(id).map(|p| p.outcome),
             Some(ProbeOutcome::Unsupported)
         )
+    }
+
+    /// Numbers from the last probe that returned any.
+    fn last_windows(&self, id: &str) -> Option<&[Window]> {
+        self.entries.get(id).and_then(|p| p.windows.as_deref())
     }
 
     /// Drop memory of connections OmniRoute no longer reports.
@@ -160,7 +208,7 @@ struct CachedUsage {
 pub fn fetch(
     base_url: &str,
     creds: &Credentials,
-    probes: &mut ProbeLog,
+    probes: &Mutex<ProbeLog>,
 ) -> Result<Vec<AccountLimits>, RateLimitError> {
     let providers_raw = get(base_url, "/api/providers", creds, LOCAL_TIMEOUT)?;
     let connections = parse_connections(&providers_raw)?;
@@ -170,27 +218,27 @@ pub fn fetch(
     // path — a LIVE call to the provider on every request. Polling that every 5s
     // for every account is what made an account flap to "usage unavailable"
     // (timeouts, upstream rate limits) while the dashboard, reading the cache,
-    // showed it fine (#61). A missing map (an older OmniRoute) is not fatal: every
-    // account then goes through the throttled live path below.
+    // showed it fine (#61). A missing map (an older OmniRoute, or a failed read)
+    // is not fatal: every account then goes through the throttled live path
+    // below, and the ones it has no numbers for are flagged so the caller keeps
+    // their last known bars.
     let cached = match get(base_url, "/api/usage/provider-limits", creds, LOCAL_TIMEOUT)
         .and_then(|raw| parse_provider_limits(&raw))
     {
-        Ok(map) => map,
+        Ok(map) => Some(map),
         Err(e @ RateLimitError::Unauthorized(_)) => return Err(e),
         Err(e) => {
             log::debug!("provider-limits cache unavailable, probing live: {e}");
-            HashMap::new()
+            None
         }
     };
 
     let now = Instant::now();
     let now_ms = unix_millis();
-    let ids: Vec<String> = connections.iter().map(|c| c.id.clone()).collect();
-    probes.retain(&ids);
 
     let mut usage: HashMap<String, CachedUsage> = HashMap::new();
     for conn in &connections {
-        if let Some(entry) = cached.get(&conn.id) {
+        if let Some(entry) = cached.as_ref().and_then(|c| c.get(&conn.id)) {
             // An entry we cannot read is treated like no entry: the live probe
             // decides, and failing that the account is flagged, not blanked.
             if let Ok(windows) = windows_from_body(entry) {
@@ -210,7 +258,41 @@ pub fn fetch(
         .filter(|c| c.active)
         .map(|c| (c.id.clone(), usage.get(&c.id).and_then(|u| u.age_ms)))
         .collect();
-    let due = plan_probes(&candidates, probes, now);
+
+    // Plan under the lock, probe without it: a probe may take seconds, and the
+    // 5s poll must not queue behind the background refresh (or vice versa).
+    let ids: Vec<String> = connections.iter().map(|c| c.id.clone()).collect();
+    let due = {
+        let mut log = probes.lock().unwrap();
+        log.retain(&ids);
+        let due = plan_probes(&candidates, &log, now);
+        log.reserve(&due, now);
+        due
+    };
+
+    let live: HashMap<String, (ProbeOutcome, Option<Vec<Window>>)> = due
+        .into_iter()
+        .map(|id| {
+            let outcome = match probe_live(base_url, &id, creds) {
+                Ok(l) if l.stale => (ProbeOutcome::Stale, Some(l.windows)),
+                Ok(l) => (ProbeOutcome::Fresh, Some(l.windows)),
+                Err(RateLimitError::Unsupported) => (ProbeOutcome::Unsupported, None),
+                Err(e) => {
+                    log::debug!("live usage probe failed for {id}: {e}");
+                    (ProbeOutcome::Failed, None)
+                }
+            };
+            (id, outcome)
+        })
+        .collect();
+
+    let log = {
+        let mut log = probes.lock().unwrap();
+        for (id, (outcome, windows)) in &live {
+            log.record(id, *outcome, windows.clone(), now);
+        }
+        log
+    };
 
     let mut result = Vec::new();
     for conn in connections {
@@ -220,32 +302,37 @@ pub fn fetch(
             .and_then(|u| u.age_ms)
             .is_some_and(|age| age >= 0 && (age as u128) < REFRESH_AFTER.as_millis());
 
-        if due.contains(&conn.id) {
-            match probe_live(base_url, &conn.id, creds) {
-                Ok(live) => {
-                    windows = Some(live.windows);
-                    fresh = !live.stale;
-                    let outcome = if live.stale {
-                        ProbeOutcome::Stale
-                    } else {
-                        ProbeOutcome::Fresh
-                    };
-                    probes.record(&conn.id, outcome, now);
-                }
-                Err(RateLimitError::Unsupported) => {
-                    probes.record(&conn.id, ProbeOutcome::Unsupported, now);
-                }
-                Err(e) => {
-                    log::debug!("live usage probe failed for {}: {e}", conn.id);
-                    probes.record(&conn.id, ProbeOutcome::Failed, now);
-                }
+        match live.get(&conn.id) {
+            Some((ProbeOutcome::Fresh, Some(w))) => {
+                windows = Some(w.clone());
+                fresh = true;
             }
+            Some((ProbeOutcome::Stale, Some(w))) => {
+                windows = Some(w.clone());
+                fresh = false;
+            }
+            _ => {}
+        }
+        // No cache entry (older OmniRoute, or a failed read): the last numbers a
+        // probe returned stand in, so an account does not blank between probes.
+        if windows.is_none() {
+            windows = log.last_windows(&conn.id).map(<[Window]>::to_vec);
+        }
+        // Confirmed without a usage API: whatever the cache still holds is obsolete.
+        let unsupported = log.unsupported(&conn.id);
+        if unsupported {
+            windows = Some(Vec::new());
         }
 
-        // Flagged only when the tray's own last look failed AND nothing fresher
-        // has landed in OmniRoute's cache since (the dashboard or the scheduler
-        // may have refreshed it). A fresh entry is good data whoever fetched it.
-        let usage_unavailable = conn.active && !fresh && probes.unavailable(&conn.id);
+        // Flagged when the tray's own last look failed AND nothing fresher has
+        // landed in OmniRoute's cache since (the dashboard or the scheduler may
+        // have refreshed it) — a fresh entry is good data whoever fetched it —
+        // or when the cache could not be read and no probe has numbers for this
+        // account yet, so the caller carries over its last known windows.
+        let no_numbers = windows.is_none();
+        let usage_unavailable = conn.active
+            && !fresh
+            && (log.unavailable(&conn.id) || (cached.is_none() && no_numbers && !unsupported));
         result.push(AccountLimits {
             id: conn.id,
             account: conn.name,
@@ -332,9 +419,21 @@ fn get(
         // token (an inference-only key with login enabled). Both are auth, not network.
         Err(ureq::Error::Status(code @ (401 | 403), _)) => Err(RateLimitError::Unauthorized(code)),
         // `/api/usage/<id>` answers 400 "Usage not available for this connection"
-        // for a provider without a usage API. Not a failure to retry.
-        Err(ureq::Error::Status(400, _)) => Err(RateLimitError::Unsupported),
+        // for a provider without a usage API. Not a failure to retry — but only
+        // that answer; any other 400 is a failure like the rest.
+        Err(ureq::Error::Status(400, resp)) => {
+            Err(error_for_400(&resp.into_string().unwrap_or_default()))
+        }
         Err(e) => Err(RateLimitError::Network(e.to_string())),
+    }
+}
+
+fn error_for_400(body: &str) -> RateLimitError {
+    if body.contains("Usage not available") {
+        RateLimitError::Unsupported
+    } else {
+        let short: String = body.chars().take(200).collect();
+        RateLimitError::Network(format!("HTTP 400: {short}"))
     }
 }
 
@@ -1015,7 +1114,7 @@ mod tests {
         let mut log = ProbeLog::default();
         let candidates = vec![("a".to_string(), None)];
         assert_eq!(plan_probes(&candidates, &log, t0), vec!["a".to_string()]);
-        log.record("a", ProbeOutcome::Failed, t0);
+        log.record("a", ProbeOutcome::Failed, None, t0);
         assert!(log.unavailable("a"));
         assert!(
             plan_probes(&candidates, &log, t0 + secs(5)).is_empty(),
@@ -1025,7 +1124,7 @@ mod tests {
             plan_probes(&candidates, &log, t0 + PROBE_GAP),
             vec!["a".to_string()]
         );
-        log.record("a", ProbeOutcome::Fresh, t0 + PROBE_GAP);
+        log.record("a", ProbeOutcome::Fresh, None, t0 + PROBE_GAP);
         assert!(!log.unavailable("a"), "a success clears the flag");
     }
 
@@ -1033,7 +1132,7 @@ mod tests {
     fn unsupported_connections_are_rechecked_rarely_and_not_flagged() {
         let t0 = Instant::now();
         let mut log = ProbeLog::default();
-        log.record("api", ProbeOutcome::Unsupported, t0);
+        log.record("api", ProbeOutcome::Unsupported, None, t0);
         assert!(log.unsupported("api"));
         assert!(
             !log.unavailable("api"),
@@ -1060,7 +1159,7 @@ mod tests {
     #[test]
     fn a_stale_server_answer_counts_as_not_fresh() {
         let mut log = ProbeLog::default();
-        log.record("a", ProbeOutcome::Stale, Instant::now());
+        log.record("a", ProbeOutcome::Stale, None, Instant::now());
         assert!(log.unavailable("a"));
     }
 
@@ -1079,35 +1178,32 @@ mod tests {
             api_key: None,
             cli_token: crate::omniauth::resolve_cli_token(&env_path),
         };
-        let mut probes = ProbeLog::default();
+        let probes = Mutex::new(ProbeLog::default());
 
         let t = Instant::now();
-        let first = fetch(&base, &creds, &mut probes).expect("first fetch");
+        let first = fetch(&base, &creds, &probes).expect("first fetch");
         let first_ms = t.elapsed().as_millis();
         assert!(!first.is_empty(), "the reference instance has accounts");
         for a in &first {
+            // Provider + id prefix only: the account name is often an e-mail address.
             eprintln!(
-                "{:<40} {:<12} active={} windows={} unavailable={}",
-                a.account,
+                "{:<8} {:<14} active={} windows={} unavailable={}",
+                &a.id[..a.id.len().min(8)],
                 a.provider,
                 a.active,
                 a.windows.len(),
                 a.usage_unavailable
             );
         }
-        eprintln!(
-            "first fetch: {first_ms}ms, probes recorded: {}",
-            probes.entries.len()
-        );
-        assert!(probes.entries.len() <= MAX_PROBES_PER_FETCH);
+        let recorded = probes.lock().unwrap().entries.len();
+        eprintln!("first fetch: {first_ms}ms, probes recorded: {recorded}");
+        assert!(recorded <= MAX_PROBES_PER_FETCH);
 
         let t = Instant::now();
-        let second = fetch(&base, &creds, &mut probes).expect("second fetch");
+        let second = fetch(&base, &creds, &probes).expect("second fetch");
         let second_ms = t.elapsed().as_millis();
-        eprintln!(
-            "second fetch: {second_ms}ms, probes recorded: {}",
-            probes.entries.len()
-        );
+        let recorded = probes.lock().unwrap().entries.len();
+        eprintln!("second fetch: {second_ms}ms, probes recorded: {recorded}");
         assert_eq!(first.len(), second.len());
         assert!(
             second_ms < 2_000,
@@ -1116,11 +1212,67 @@ mod tests {
     }
 
     #[test]
+    fn last_live_numbers_survive_a_failed_probe_and_go_with_an_unsupported_one() {
+        let now = Instant::now();
+        let mut log = ProbeLog::default();
+        let windows = account("claude", 2, false).windows;
+        log.record("a", ProbeOutcome::Fresh, Some(windows.clone()), now);
+        assert_eq!(log.last_windows("a"), Some(windows.as_slice()));
+        log.record("a", ProbeOutcome::Failed, None, now + PROBE_GAP);
+        assert_eq!(
+            log.last_windows("a"),
+            Some(windows.as_slice()),
+            "a failure keeps the last numbers for the polls in between"
+        );
+        assert!(log.unavailable("a"));
+        log.record("a", ProbeOutcome::Unsupported, None, now + PROBE_GAP * 2);
+        assert_eq!(
+            log.last_windows("a"),
+            None,
+            "no usage API: old bars are obsolete"
+        );
+    }
+
+    #[test]
+    fn a_reserved_probe_blocks_an_overlapping_fetch_without_flagging_the_account() {
+        let now = Instant::now();
+        let mut log = ProbeLog::default();
+        let windows = account("claude", 1, false).windows;
+        log.record("a", ProbeOutcome::Fresh, Some(windows.clone()), now);
+        log.reserve(&["a".to_string(), "b".to_string()], now + PROBE_GAP);
+        assert!(!log.may_probe("a", now + PROBE_GAP + secs(5)));
+        assert!(!log.may_probe("b", now + PROBE_GAP + secs(5)));
+        assert!(!log.unavailable("a"), "in flight is not a failure");
+        assert_eq!(
+            log.last_windows("a"),
+            Some(windows.as_slice()),
+            "reserving keeps the numbers"
+        );
+        assert!(
+            log.may_probe("a", now + PROBE_GAP * 2),
+            "an abandoned reservation expires"
+        );
+    }
+
+    #[test]
+    fn only_the_documented_400_means_unsupported() {
+        assert!(matches!(
+            error_for_400(r#"{"error":"Usage not available for this connection"}"#),
+            RateLimitError::Unsupported
+        ));
+        assert!(matches!(
+            error_for_400(r#"{"error":"connectionId is required"}"#),
+            RateLimitError::Network(_)
+        ));
+        assert!(matches!(error_for_400(""), RateLimitError::Network(_)));
+    }
+
+    #[test]
     fn probe_log_forgets_connections_no_longer_reported() {
         let mut log = ProbeLog::default();
         let now = Instant::now();
-        log.record("gone", ProbeOutcome::Failed, now);
-        log.record("kept", ProbeOutcome::Failed, now);
+        log.record("gone", ProbeOutcome::Failed, None, now);
+        log.record("kept", ProbeOutcome::Failed, None, now);
         log.retain(&["kept".to_string()]);
         assert!(!log.unavailable("gone"));
         assert!(log.unavailable("kept"));
