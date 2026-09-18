@@ -112,9 +112,12 @@ fn get(base_url: &str, path: &str, creds: &Credentials) -> Result<String, RateLi
 fn parse_connections(raw: &str) -> Result<Vec<Connection>, RateLimitError> {
     let value: Value =
         serde_json::from_str(raw).map_err(|e| RateLimitError::Parse(e.to_string()))?;
+    // OmniRoute has served this both as a flat array and wrapped in `connections`;
+    // `health.rs` already tolerates both, and reading the wrong one here empties
+    // the account list Settings depends on.
     let arr = value
-        .get("connections")
-        .and_then(Value::as_array)
+        .as_array()
+        .or_else(|| value.get("connections").and_then(Value::as_array))
         .cloned()
         .unwrap_or_default();
 
@@ -150,9 +153,16 @@ fn parse_connections(raw: &str) -> Result<Vec<Connection>, RateLimitError> {
 pub fn parse_usage(raw: &str) -> Result<Vec<Window>, RateLimitError> {
     let value: Value =
         serde_json::from_str(raw).map_err(|e| RateLimitError::Parse(e.to_string()))?;
-    let quotas = match value.get("quotas").and_then(Value::as_object) {
-        Some(q) => q,
-        None => return Ok(Vec::new()),
+    // Absent (or null) quotas is an answer: this account has none. Any other type
+    // is a broken response, and must not be reported as "no usage" (#57).
+    let quotas = match value.get("quotas") {
+        Some(Value::Object(q)) => q,
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(_) => {
+            return Err(RateLimitError::Parse(
+                "`quotas` is not an object".to_string(),
+            ))
+        }
     };
 
     let mut windows = Vec::new();
@@ -388,6 +398,13 @@ mod tests {
     #[test]
     fn no_quotas_yields_empty() {
         assert!(parse_usage(r#"{"plan":"x"}"#).unwrap().is_empty());
+        assert!(parse_usage(r#"{"quotas":null}"#).unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_quotas_is_an_error_not_an_idle_account() {
+        assert!(parse_usage(r#"{"quotas":[]}"#).is_err());
+        assert!(parse_usage(r#"{"quotas":"none"}"#).is_err());
     }
 
     #[test]
@@ -501,6 +518,18 @@ mod tests {
             "a successful empty answer is the truth, not a gap to fill"
         );
         assert!(fresh[1].windows.is_empty(), "nothing cached for this one");
+    }
+
+    #[test]
+    fn parses_connections_from_either_shape() {
+        let wrapped =
+            r#"{"connections":[{"id":"a","provider":"claude","name":"me","isActive":true}]}"#;
+        let flat = r#"[{"id":"a","provider":"claude","name":"me","isActive":true}]"#;
+        for raw in [wrapped, flat] {
+            let conns = parse_connections(raw).unwrap();
+            assert_eq!(conns.len(), 1, "shape: {raw}");
+            assert_eq!(conns[0].provider, "claude");
+        }
     }
 
     #[test]
