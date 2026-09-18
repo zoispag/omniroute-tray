@@ -447,14 +447,24 @@ fn build_popover(app: &tauri::AppHandle) -> Option<tauri::WebviewWindow> {
         .app
         .windows
         .iter()
-        .find(|w| w.label == POPOVER_LABEL)?
-        .clone();
-    let window = tauri::WebviewWindowBuilder::from_config(app, &config)
-        .ok()?
-        .build()
-        .ok()?;
-    spaces::follow_active_space(&window);
-    Some(window)
+        .find(|w| w.label == POPOVER_LABEL)
+        .cloned();
+    let Some(config) = config else {
+        log::error!("no `{POPOVER_LABEL}` window in the app config");
+        return None;
+    };
+    // The whole UI hangs off this window, so a failure here must say why: it is
+    // the one error that leaves the tray with nothing to show.
+    match tauri::WebviewWindowBuilder::from_config(app, &config).and_then(|w| w.build()) {
+        Ok(window) => {
+            spaces::follow_active_space(&window);
+            Some(window)
+        }
+        Err(err) => {
+            log::error!("could not build the popover window: {err}");
+            None
+        }
+    }
 }
 
 /// The popover, rebuilt if it has gone missing.
@@ -822,8 +832,10 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
+            // Cause is logged by `build_popover`; note the consequence, since a
+            // tray with no popover has no UI at all until the next click retries.
             if build_popover(app.handle()).is_none() {
-                log::error!("could not build the popover window");
+                log::error!("starting without a popover; the next tray click retries");
             }
 
             let tray_icon =
