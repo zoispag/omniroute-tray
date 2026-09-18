@@ -181,6 +181,17 @@ impl ProbeLog {
         }
     }
 
+    /// Drop an `Unsupported` verdict that OmniRoute's cache has since disproved
+    /// (it wrote a usable entry after the probe). The account goes back to the
+    /// normal probe gap and is no longer rendered as having no usage API.
+    fn retract_unsupported(&mut self, id: &str) {
+        if let Some(p) = self.entries.get_mut(id) {
+            if p.outcome == Some(ProbeOutcome::Unsupported) {
+                p.outcome = None;
+            }
+        }
+    }
+
     /// The last completed probe did not produce fresh numbers.
     fn unavailable(&self, id: &str) -> bool {
         matches!(
@@ -286,6 +297,20 @@ pub fn fetch(
     let due = {
         let mut log = probes.lock().unwrap();
         log.retain(&ids);
+        // An `Unsupported` verdict is disproved by a usable entry OmniRoute wrote
+        // AFTER the probe that produced it: the usage API works now. Retract it
+        // before planning, or the account would sit out the hour-long recheck
+        // gap (and be rendered as having no usage) despite live data in the cache.
+        for (id, age) in &candidates {
+            if log.unsupported(id)
+                && entry_postdates_verdict(
+                    *age,
+                    log.last_attempt(id).map(|t| now.duration_since(t)),
+                )
+            {
+                log.retract_unsupported(id);
+            }
+        }
         let due = plan_probes(&candidates, &log, now);
         log.reserve(&due, now);
         due
@@ -343,14 +368,9 @@ pub fn fetch(
             windows = log.last_windows(&conn.id).map(<[Window]>::to_vec);
         }
         // Confirmed without a usage API: whatever the cache still holds is
-        // obsolete — unless OmniRoute wrote a usable entry AFTER that verdict,
-        // which means the usage API works now and the hour-old verdict does not.
-        // An entry older than the verdict is exactly the obsolete data to drop.
-        let unsupported = log.unsupported(&conn.id)
-            && !entry_postdates_verdict(
-                usage.get(&conn.id).and_then(|u| u.age_ms),
-                log.last_attempt(&conn.id).map(|t| now.duration_since(t)),
-            );
+        // obsolete data to drop. (A verdict disproved by a newer entry was
+        // retracted above, before planning.)
+        let unsupported = log.unsupported(&conn.id);
         if unsupported {
             windows = Some(Vec::new());
         }
@@ -1438,6 +1458,39 @@ mod tests {
             !entry_postdates_verdict(Some(-5_000), since),
             "clock skew is not freshness"
         );
+    }
+
+    #[test]
+    fn a_disproved_unsupported_verdict_returns_the_account_to_the_normal_gap() {
+        let t0 = Instant::now();
+        let mut log = ProbeLog::default();
+        log.record("u", ProbeOutcome::Unsupported, None, t0);
+        let later = t0 + secs(600);
+        // OmniRoute wrote a usable entry 30s ago, well after the verdict.
+        let candidates = vec![("u".to_string(), Some(30_000))];
+        assert!(
+            entry_postdates_verdict(Some(30_000), Some(later.duration_since(t0))),
+            "the entry disproves the verdict"
+        );
+        assert!(
+            plan_probes(&candidates, &log, later).is_empty(),
+            "still fresh: nothing to probe yet"
+        );
+        log.retract_unsupported("u");
+        assert!(
+            !log.unsupported("u"),
+            "no longer rendered as having no usage API"
+        );
+        let stale = vec![("u".to_string(), Some(REFRESH_AFTER.as_millis() as i64 + 1))];
+        assert_eq!(
+            plan_probes(&stale, &log, later),
+            vec!["u".to_string()],
+            "once the entry ages past REFRESH_AFTER it is refreshed under the normal gap, not the hour"
+        );
+        // Retracting anything else is a no-op.
+        log.record("f", ProbeOutcome::Failed, None, t0);
+        log.retract_unsupported("f");
+        assert!(log.unavailable("f"));
     }
 
     #[test]
