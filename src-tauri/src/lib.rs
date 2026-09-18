@@ -50,6 +50,12 @@ struct AppState {
     /// `get_rate_limits` as a fallback when a live fetch fails, so the UI keeps the
     /// last-known values instead of blanking.
     rate_limit_cache: Mutex<Option<Vec<ratelimits::AccountLimits>>>,
+    /// When the tray last asked OmniRoute for a LIVE usage lookup of each account,
+    /// and how that went. `ratelimits::fetch` reads the cached provider-limits map
+    /// and only probes live for stale or missing entries, no more than once a
+    /// minute per account (#61). Held across the whole fetch, so the 5s poll and
+    /// the background refresh never probe the same account at once.
+    usage_probes: Mutex<ratelimits::ProbeLog>,
     /// Provider marks fetched from the server's `/providers/<id>.svg`, keyed by
     /// provider id and valid for one served OmniRoute version. `None` records that
     /// the server has no mark for it (the popover then shows a lettered badge);
@@ -77,6 +83,7 @@ impl AppState {
             supervisor: Mutex::new(None),
             pin_open: std::sync::atomic::AtomicBool::new(false),
             rate_limit_cache: Mutex::new(None),
+            usage_probes: Mutex::new(ratelimits::ProbeLog::default()),
             provider_icons: Mutex::new(ProviderIconCache::default()),
         }
     }
@@ -381,7 +388,11 @@ fn schedule_quota_refresh(app: tauri::AppHandle) {
         if creds.is_empty() {
             continue;
         }
-        let Ok(mut limits) = ratelimits::fetch(SERVER_URL, &creds) else {
+        let fetched = {
+            let mut probes = app_state.usage_probes.lock().unwrap();
+            ratelimits::fetch(SERVER_URL, &creds, &mut probes)
+        };
+        let Ok(mut limits) = fetched else {
             continue;
         };
         {
@@ -568,7 +579,9 @@ async fn get_rate_limits(
             // popover must show it as unavailable and keep any cached rows.
             return Err(ratelimits::RateLimitError::NoCredentials);
         }
-        ratelimits::fetch(SERVER_URL, &creds)
+        let state = app.state::<AppState>();
+        let mut probes = state.usage_probes.lock().unwrap();
+        ratelimits::fetch(SERVER_URL, &creds, &mut probes)
     })
     .await
     .map_err(|e| e.to_string())?;
