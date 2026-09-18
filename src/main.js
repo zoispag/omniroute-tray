@@ -140,9 +140,12 @@ async function fillSettingsAccounts() {
   }
   if (!Array.isArray(data)) return;
   rateLimitsLoaded = true;
-  if (!data.length || !inSettings || settingsTouched) return;
+  if (!data.length) return;
+  // Keep what we fetched whatever the view is doing — only the repaint is guarded,
+  // or the main view would go back to claiming there are no accounts.
   rateLimitCache = data;
-  await renderSettings();
+  if (!inSettings || settingsTouched) return;
+  await renderSettings({ automatic: true });
 }
 
 function mainContentHTML() {
@@ -1128,15 +1131,20 @@ async function renderTrend() {
   wireSparkline();
 }
 
-async function renderSettings() {
+// `automatic` marks a render nobody asked for (data arriving late). Those stand
+// down as soon as the page is the user's; Show all and reordering are explicit and
+// always redraw from the current state.
+async function renderSettings({ automatic = false } = {}) {
   const content = document.getElementById("content");
   let autostart = false;
   try {
     autostart = await invoke("get_autostart");
   } catch {}
   // Background callers make this reachable at any time, and the user may have left
-  // Settings during that await — a late render would paint it over the main view.
+  // Settings — or touched a row — during that await. A late render would paint
+  // Settings over the main view, or pull a just-restored row out from under them.
   if (!inSettings) return;
+  if (automatic && settingsTouched) return;
   settingsNeedsAccounts = !rateLimitCache.length;
 
   const groups = groupByProvider(settingsAccounts());
@@ -1450,7 +1458,7 @@ getCurrentWindow().listen("quota-refreshed", (event) => {
   // else repaints it while it is open. Fill it in — but only then: re-rendering
   // under the pointer is the other half of #57.
   if (settingsNeedsAccounts && rateLimitCache.length && !settingsTouched) {
-    renderSettings();
+    renderSettings({ automatic: true });
   }
 });
 
