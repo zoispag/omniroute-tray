@@ -43,12 +43,18 @@ pub fn follow_active_space<R: Runtime>(_window: &WebviewWindow<R>) {}
 
 /// The behaviour flags of a window that shows up wherever the user is.
 ///
-/// `FullScreenPrimary` is cleared because it is mutually exclusive with
-/// `FullScreenAuxiliary`: it marks a window that can itself *become* full screen,
-/// which the popover never does.
+/// Both flags we want have members they are mutually exclusive with, and AppKit
+/// says nothing about which one wins when they are set together: `CanJoinAllSpaces`
+/// rules out `MoveToActiveSpace`, and `FullScreenAuxiliary` rules out
+/// `FullScreenPrimary` (a window that can itself *become* full screen, which the
+/// popover never does) and `FullScreenNone`. `tao` sets none of the three today,
+/// but the result should not depend on that.
 #[cfg(target_os = "macos")]
 fn across_all_spaces(current: NSWindowCollectionBehavior) -> NSWindowCollectionBehavior {
-    (current & !NSWindowCollectionBehavior::FullScreenPrimary)
+    let conflicting = NSWindowCollectionBehavior::MoveToActiveSpace
+        | NSWindowCollectionBehavior::FullScreenPrimary
+        | NSWindowCollectionBehavior::FullScreenNone;
+    (current & !conflicting)
         | NSWindowCollectionBehavior::CanJoinAllSpaces
         | NSWindowCollectionBehavior::FullScreenAuxiliary
 }
@@ -66,10 +72,17 @@ mod tests {
     }
 
     #[test]
-    fn the_exclusive_full_screen_primary_flag_is_dropped() {
-        let behavior = across_all_spaces(Behavior::FullScreenPrimary);
-        assert!(!behavior.contains(Behavior::FullScreenPrimary));
-        assert!(behavior.contains(Behavior::FullScreenAuxiliary));
+    fn the_flags_that_contradict_the_two_we_set_are_dropped() {
+        for conflicting in [
+            Behavior::MoveToActiveSpace,
+            Behavior::FullScreenPrimary,
+            Behavior::FullScreenNone,
+        ] {
+            let behavior = across_all_spaces(conflicting);
+            assert!(!behavior.contains(conflicting), "{conflicting:?} survived");
+            assert!(behavior.contains(Behavior::CanJoinAllSpaces));
+            assert!(behavior.contains(Behavior::FullScreenAuxiliary));
+        }
     }
 
     #[test]
