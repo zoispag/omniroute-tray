@@ -76,6 +76,25 @@ pub fn fetch(base_url: &str, creds: &Credentials) -> Result<Vec<AccountLimits>, 
     Ok(result)
 }
 
+/// Keep the last good windows for an account whose usage lookup just failed, so a
+/// per-account error does not blank that provider's bars. Same intent as the
+/// whole-list fallback in `get_rate_limits`: show the last known values rather
+/// than nothing. The `usage_unavailable` flag stays set, so the UI can still say
+/// the numbers are not fresh.
+pub fn carry_over_windows(previous: &[AccountLimits], fresh: &mut [AccountLimits]) {
+    for acc in fresh.iter_mut() {
+        if !acc.usage_unavailable || !acc.windows.is_empty() {
+            continue;
+        }
+        if let Some(prev) = previous
+            .iter()
+            .find(|p| p.provider == acc.provider && p.account == acc.account)
+        {
+            acc.windows.clone_from(&prev.windows);
+        }
+    }
+}
+
 fn get(base_url: &str, path: &str, creds: &Credentials) -> Result<String, RateLimitError> {
     let url = format!("{base_url}{path}");
     let req = creds.apply(ureq::get(&url).timeout(std::time::Duration::from_secs(4)));
@@ -443,6 +462,45 @@ mod tests {
         assert_eq!(conns.len(), 2, "an inactive account still exists (#57)");
         assert!(conns[0].active);
         assert!(!conns[1].active);
+    }
+
+    fn account(provider: &str, windows: usize, unavailable: bool) -> AccountLimits {
+        AccountLimits {
+            account: "main".into(),
+            provider: provider.into(),
+            windows: (0..windows)
+                .map(|_| Window {
+                    label: "Session".into(),
+                    short: "5h".into(),
+                    used_percent: 42.0,
+                    reset_at: None,
+                    unlimited: false,
+                })
+                .collect(),
+            active: true,
+            usage_unavailable: unavailable,
+        }
+    }
+
+    #[test]
+    fn carries_last_known_windows_into_a_failed_lookup() {
+        let previous = vec![account("claude", 2, false)];
+        let mut fresh = vec![account("claude", 0, true)];
+        carry_over_windows(&previous, &mut fresh);
+        assert_eq!(fresh[0].windows.len(), 2);
+        assert!(fresh[0].usage_unavailable, "still flagged as not fresh");
+    }
+
+    #[test]
+    fn carry_over_leaves_successful_and_unknown_accounts_alone() {
+        let previous = vec![account("claude", 2, false)];
+        let mut fresh = vec![account("claude", 0, false), account("codex", 0, true)];
+        carry_over_windows(&previous, &mut fresh);
+        assert!(
+            fresh[0].windows.is_empty(),
+            "a successful empty answer is the truth, not a gap to fill"
+        );
+        assert!(fresh[1].windows.is_empty(), "nothing cached for this one");
     }
 
     #[test]

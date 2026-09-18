@@ -261,10 +261,16 @@ function accountStatus(acc) {
     };
   }
   if (acc.usage_unavailable) {
-    return {
-      text: "usage unavailable",
-      tip: "OmniRoute did not answer the usage lookup for this account. Often transient.",
-    };
+    // With windows it is still in the Usage list, on carried-over numbers.
+    return acc.windows && acc.windows.length
+      ? {
+          text: "last known",
+          tip: "OmniRoute did not answer the latest usage lookup; showing the last values it returned.",
+        }
+      : {
+          text: "usage unavailable",
+          tip: "OmniRoute did not answer the usage lookup for this account. Often transient.",
+        };
   }
   if (!acc.windows || !acc.windows.length) {
     return {
