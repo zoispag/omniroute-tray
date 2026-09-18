@@ -14,6 +14,7 @@ mod provider_icons;
 mod ratelimits;
 mod registry;
 mod runtime;
+mod spaces;
 mod state;
 mod supervisor;
 mod traymenu;
@@ -437,10 +438,12 @@ fn recreate_popover(app: &tauri::AppHandle) -> Option<tauri::WebviewWindow> {
         .find(|w| w.label == POPOVER_LABEL)?
         .clone();
     log::warn!("popover window was gone; rebuilding it");
-    tauri::WebviewWindowBuilder::from_config(app, &config)
+    let window = tauri::WebviewWindowBuilder::from_config(app, &config)
         .ok()?
         .build()
-        .ok()
+        .ok()?;
+    spaces::follow_active_space(&window);
+    Some(window)
 }
 
 fn toggle_popover(app: &tauri::AppHandle) {
@@ -794,6 +797,9 @@ pub fn run() {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             if let Some(window) = app.get_webview_window(POPOVER_LABEL) {
+                // The popover is built once and never moves, so without this it
+                // stays on the space the app launched on (#58).
+                spaces::follow_active_space(&window);
                 let _ = window.hide();
             }
 
