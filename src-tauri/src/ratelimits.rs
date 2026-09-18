@@ -162,6 +162,14 @@ fn parse_connections(raw: &str) -> Result<Vec<Connection>, RateLimitError> {
             active,
         });
     }
+    // Same rule one level down: an empty answer is only believable when the server
+    // actually sent an empty array. Entries we could not read at all mean a shape
+    // we do not understand, and an empty success would wipe the cached accounts.
+    if connections.is_empty() && !arr.is_empty() {
+        return Err(RateLimitError::Parse(
+            "no /api/providers entry carried an id and a provider".to_string(),
+        ));
+    }
     Ok(connections)
 }
 
@@ -585,5 +593,11 @@ mod tests {
         let conns = parse_connections(raw).unwrap();
         assert_eq!(conns.len(), 1);
         assert_eq!(conns[0].id, "c");
+    }
+
+    #[test]
+    fn entries_we_cannot_read_at_all_are_an_error_not_an_empty_list() {
+        let unreadable = r#"{"connections":[{"name":"no id"},{"name":"no provider"}]}"#;
+        assert!(parse_connections(unreadable).is_err());
     }
 }
