@@ -103,6 +103,7 @@ async function toggleSettings() {
   // Settings would open halfway down, its header out of sight.
   const content = document.getElementById("content");
   if (content) content.scrollTop = 0;
+  settingsTouched = false;
   if (inSettings) {
     if (!rateLimitCache.length) {
       try {
@@ -139,7 +140,7 @@ async function fillSettingsAccounts() {
   }
   if (!Array.isArray(data)) return;
   rateLimitsLoaded = true;
-  if (!data.length || !inSettings) return;
+  if (!data.length || !inSettings || settingsTouched) return;
   rateLimitCache = data;
   await renderSettings();
 }
@@ -232,6 +233,10 @@ let inSettings = false;
 // rows can fill that list on their own, so the flag — not the presence of a row —
 // is what says the live accounts are still missing.
 let settingsNeedsAccounts = false;
+// The user has toggled an account since this Settings page was drawn. Automatic
+// re-renders stand down until it is reopened: a row that disappears under the
+// pointer that just restored it is the very complaint behind #57.
+let settingsTouched = false;
 
 function accountKey(acc) {
   return `${acc.provider}/${acc.account}`;
@@ -772,6 +777,7 @@ function saveHiddenAccounts() {
 
 async function renderRateLimits() {
   const section = document.getElementById("ratelimits");
+  if (!section) return; // Settings replaced the main view mid-poll
   if (!rateLimitCache.length && !rateLimitsLoaded) {
     section.innerHTML = usageSkeleton();
   }
@@ -781,7 +787,10 @@ async function renderRateLimits() {
       rateLimitCache = data;
       rateLimitsLoaded = true;
     }
+    // The cache is always worth updating; the DOM below may be gone by now.
+    if (!document.getElementById("ratelimits")) return;
   } catch (err) {
+    if (!document.getElementById("ratelimits")) return;
     if (!rateLimitCache.length) {
       // Nothing to fall back on: say why instead of spinning forever (#42).
       section.innerHTML = `<div class="section-head"><h3>Usage</h3></div>
@@ -803,6 +812,8 @@ function usageSkeleton() {
 
 function paintRateLimits() {
   const section = document.getElementById("ratelimits");
+  // The fetch in front of this one may have outlived the main view.
+  if (!section) return;
   if (!rateLimitCache.length) {
     section.innerHTML = rateLimitsLoaded
       ? `<div class="section-head"><h3>Usage</h3></div><p class="placeholder">No accounts connected to OmniRoute.</p>`
@@ -1233,6 +1244,7 @@ async function renderSettings() {
   }
   content.querySelectorAll(".set-check").forEach((c) => {
     c.onchange = () => {
+      settingsTouched = true;
       setAccountHidden(c.dataset.key, !c.checked);
       // No re-render: a row must not vanish under the pointer that just ticked it.
       // Re-enabling an account OmniRoute no longer reports has to look like it took
@@ -1437,7 +1449,9 @@ getCurrentWindow().listen("quota-refreshed", (event) => {
   // credential-less window on a fresh install) shows an empty list, and nothing
   // else repaints it while it is open. Fill it in — but only then: re-rendering
   // under the pointer is the other half of #57.
-  if (settingsNeedsAccounts && rateLimitCache.length) renderSettings();
+  if (settingsNeedsAccounts && rateLimitCache.length && !settingsTouched) {
+    renderSettings();
+  }
 });
 
 const gearBtn = document.getElementById("gear-btn");
