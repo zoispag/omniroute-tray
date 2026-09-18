@@ -94,6 +94,10 @@ function escapeHtml(s) {
 async function toggleSettings() {
   inSettings = !inSettings;
   document.getElementById("gear-btn")?.classList.toggle("active", inSettings);
+  // #content scrolls now, and replacing its markup keeps the old scroll offset —
+  // Settings would open halfway down, its header out of sight.
+  const content = document.getElementById("content");
+  if (content) content.scrollTop = 0;
   if (inSettings) {
     if (!rateLimitCache.length) {
       try {
@@ -104,6 +108,7 @@ async function toggleSettings() {
     document.getElementById("update").innerHTML = "";
     clearSections();
     await renderSettings();
+    if (content) content.scrollTop = 0;
   } else {
     document.getElementById("content").innerHTML = mainContentHTML();
     paintRateLimits();
@@ -1386,7 +1391,17 @@ getCurrentWindow().listen("quota-refreshed", (event) => {
     rateLimitCache = event.payload;
     rateLimitsLoaded = true;
   }
-  if (!inSettings) paintRateLimits();
+  if (!inSettings) {
+    paintRateLimits();
+    return;
+  }
+  // Settings opened before any account data arrived (a failed first fetch, or the
+  // credential-less window on a fresh install) shows an empty list, and nothing
+  // else repaints it while it is open. Fill it in — but only while it is empty:
+  // re-rendering under the pointer is the other half of #57.
+  if (rateLimitCache.length && !document.querySelector(".set-check")) {
+    renderSettings();
+  }
 });
 
 const gearBtn = document.getElementById("gear-btn");
