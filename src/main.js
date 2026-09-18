@@ -133,7 +133,7 @@ async function fillSettingsAccounts() {
   }
   if (!Array.isArray(data)) return;
   rateLimitsLoaded = true;
-  if (!data.length) return;
+  if (!data.length || !inSettings) return;
   rateLimitCache = data;
   await renderSettings();
 }
@@ -1113,11 +1113,14 @@ async function renderTrend() {
 
 async function renderSettings() {
   const content = document.getElementById("content");
-  settingsNeedsAccounts = !rateLimitCache.length;
   let autostart = false;
   try {
     autostart = await invoke("get_autostart");
   } catch {}
+  // Background callers make this reachable at any time, and the user may have left
+  // Settings during that await — a late render would paint it over the main view.
+  if (!inSettings) return;
+  settingsNeedsAccounts = !rateLimitCache.length;
 
   const groups = groupByProvider(settingsAccounts());
   const providers = groups.map(([p]) => p);
