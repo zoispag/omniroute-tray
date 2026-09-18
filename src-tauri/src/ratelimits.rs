@@ -25,6 +25,10 @@ pub struct Window {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AccountLimits {
+    /// OmniRoute's connection id — the only stable identity an account has. Two
+    /// connections of one provider are both usually named "main", so anything
+    /// that has to match an account across fetches matches on this.
+    pub id: String,
     pub account: String,
     pub provider: String,
     pub windows: Vec<Window>,
@@ -56,7 +60,7 @@ pub fn fetch(base_url: &str, creds: &Credentials) -> Result<Vec<AccountLimits>, 
     let mut result = Vec::new();
     for conn in connections {
         let (windows, usage_unavailable) = if conn.active {
-            match get(base_url, &format!("/api/usage/{}", conn.id), creds)
+            match get(base_url, &format!("/api/usage/{}", &conn.id), creds)
                 .and_then(|raw| parse_usage(&raw))
             {
                 Ok(windows) => (windows, false),
@@ -66,6 +70,7 @@ pub fn fetch(base_url: &str, creds: &Credentials) -> Result<Vec<AccountLimits>, 
             (Vec::new(), false)
         };
         result.push(AccountLimits {
+            id: conn.id,
             account: conn.name,
             provider: conn.provider,
             windows,
@@ -86,10 +91,7 @@ pub fn carry_over_windows(previous: &[AccountLimits], fresh: &mut [AccountLimits
         if !acc.usage_unavailable || !acc.windows.is_empty() {
             continue;
         }
-        if let Some(prev) = previous
-            .iter()
-            .find(|p| p.provider == acc.provider && p.account == acc.account)
-        {
+        if let Some(prev) = previous.iter().find(|p| p.id == acc.id) {
             acc.windows.clone_from(&prev.windows);
         }
     }
@@ -483,6 +485,7 @@ mod tests {
 
     fn account(provider: &str, windows: usize, unavailable: bool) -> AccountLimits {
         AccountLimits {
+            id: format!("{provider}-1"),
             account: "main".into(),
             provider: provider.into(),
             windows: (0..windows)
@@ -506,6 +509,20 @@ mod tests {
         carry_over_windows(&previous, &mut fresh);
         assert_eq!(fresh[0].windows.len(), 2);
         assert!(fresh[0].usage_unavailable, "still flagged as not fresh");
+    }
+
+    #[test]
+    fn carry_over_matches_on_id_not_on_a_shared_account_name() {
+        let mut previous = account("claude", 2, false);
+        previous.id = "conn-a".into();
+        let mut fresh = account("claude", 0, true);
+        fresh.id = "conn-b".into();
+        let mut fresh = vec![fresh];
+        carry_over_windows(&[previous], &mut fresh);
+        assert!(
+            fresh[0].windows.is_empty(),
+            "two connections of one provider are both called main; the id decides"
+        );
     }
 
     #[test]

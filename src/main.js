@@ -733,7 +733,7 @@ function saveHiddenAccounts() {
 
 async function renderRateLimits() {
   const section = document.getElementById("ratelimits");
-  if (!rateLimitCache.length) {
+  if (!rateLimitCache.length && !rateLimitsLoaded) {
     section.innerHTML = usageSkeleton();
   }
   try {
@@ -1382,7 +1382,10 @@ function fitWindow() {
 getCurrentWindow().listen("run-doctor", runDoctor);
 
 getCurrentWindow().listen("quota-refreshed", (event) => {
-  if (Array.isArray(event.payload)) rateLimitCache = event.payload;
+  if (Array.isArray(event.payload)) {
+    rateLimitCache = event.payload;
+    rateLimitsLoaded = true;
+  }
   if (!inSettings) paintRateLimits();
 });
 
