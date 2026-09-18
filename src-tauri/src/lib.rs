@@ -381,10 +381,16 @@ fn schedule_quota_refresh(app: tauri::AppHandle) {
         if creds.is_empty() {
             continue;
         }
-        let Ok(limits) = ratelimits::fetch(SERVER_URL, &creds) else {
+        let Ok(mut limits) = ratelimits::fetch(SERVER_URL, &creds) else {
             continue;
         };
-        *app_state.rate_limit_cache.lock().unwrap() = Some(limits.clone());
+        {
+            let mut cache = app_state.rate_limit_cache.lock().unwrap();
+            if let Some(previous) = cache.as_deref() {
+                ratelimits::carry_over_windows(previous, &mut limits);
+            }
+            *cache = Some(limits.clone());
+        }
         if let Some(window) = app.get_webview_window(POPOVER_LABEL) {
             let _ = window.emit("quota-refreshed", limits);
         }
@@ -537,15 +543,21 @@ async fn get_rate_limits(
     let fetched = tauri::async_runtime::spawn_blocking(move || {
         let creds = credentials_for_request(&app);
         if creds.is_empty() {
-            return Ok(Vec::new());
+            // An empty list would read as "this install has no accounts"; the
+            // popover must show it as unavailable and keep any cached rows.
+            return Err(ratelimits::RateLimitError::NoCredentials);
         }
         ratelimits::fetch(SERVER_URL, &creds)
     })
     .await
     .map_err(|e| e.to_string())?;
     match fetched {
-        Ok(limits) => {
-            *state.rate_limit_cache.lock().unwrap() = Some(limits.clone());
+        Ok(mut limits) => {
+            let mut cache = state.rate_limit_cache.lock().unwrap();
+            if let Some(previous) = cache.as_deref() {
+                ratelimits::carry_over_windows(previous, &mut limits);
+            }
+            *cache = Some(limits.clone());
             Ok(limits)
         }
         Err(e) => match state.rate_limit_cache.lock().unwrap().clone() {

@@ -59,6 +59,11 @@ async function refresh() {
     noteServerVersion(status.version);
     renderHeader(status);
     if (inSettings) {
+      // This 5s loop is the only thing still running while Settings is open; the
+      // server-side quota thread first fires 5 minutes in, which is no way to
+      // recover a Settings page whose own fetch failed. Only until a fetch lands:
+      // an empty answer is settled, and retrying it forever buys nothing.
+      if (settingsNeedsAccounts && !rateLimitsLoaded) await fillSettingsAccounts();
       return;
     }
     renderUpdate(status);
@@ -94,22 +99,51 @@ function escapeHtml(s) {
 async function toggleSettings() {
   inSettings = !inSettings;
   document.getElementById("gear-btn")?.classList.toggle("active", inSettings);
+  // #content scrolls now, and replacing its markup keeps the old scroll offset —
+  // Settings would open halfway down, its header out of sight.
+  const content = document.getElementById("content");
+  if (content) content.scrollTop = 0;
+  settingsTouched = false;
   if (inSettings) {
     if (!rateLimitCache.length) {
+      const epoch = accountsEpoch;
       try {
-        rateLimitCache = await invoke("get_rate_limits");
+        acceptAccounts(await invoke("get_rate_limits"), epoch);
       } catch {}
+      // Settings may have been closed while that was in flight; the main view is
+      // already rebuilt and clearSections() below would blank it.
+      if (!inSettings) return;
     }
     document.getElementById("update").innerHTML = "";
     clearSections();
     await renderSettings();
+    if (content) content.scrollTop = 0;
   } else {
+    settingsNeedsAccounts = false;
     document.getElementById("content").innerHTML = mainContentHTML();
     paintRateLimits();
     fitWindow();
     await refresh();
   }
   fitWindow();
+}
+
+// Fetch the accounts behind an empty Settings page. Runs off the 5s poll until a
+// fetch lands; `settingsNeedsAccounts` stays set so a later `quota-refreshed` with
+// real accounts can still fill the page in.
+async function fillSettingsAccounts() {
+  const epoch = accountsEpoch;
+  let data;
+  try {
+    data = await invoke("get_rate_limits");
+  } catch {
+    return; // still unavailable; the next tick tries again
+  }
+  // Keep what we fetched whatever the view is doing — only the repaint is guarded,
+  // or the main view would go back to claiming there are no accounts.
+  if (!acceptAccounts(data, epoch) || !data.length) return;
+  if (!inSettings || settingsTouched) return;
+  await renderSettings({ automatic: true });
 }
 
 function mainContentHTML() {
@@ -152,7 +186,11 @@ function renderHeader(status) {
   document.getElementById("version").textContent = status.version
     ? `v${status.version}`
     : "";
+  // The error slot belongs to the main view; Settings replaces the whole content
+  // element. Without this the poll threw here on every tick while Settings was
+  // open, taking the rest of refresh() — including the header — down with it.
   const errEl = document.getElementById("error");
+  if (!errEl) return;
   if (status.state === "error" && status.reason) {
     const reason = status.reason.replace(
       /View Logs/g,
@@ -192,6 +230,14 @@ let hiddenAccounts = new Set(
 );
 let accountOrder = JSON.parse(localStorage.getItem("accountOrder") || "[]");
 let inSettings = false;
+// Settings is open on a list the server has not contributed to yet. Hidden orphan
+// rows can fill that list on their own, so the flag — not the presence of a row —
+// is what says the live accounts are still missing.
+let settingsNeedsAccounts = false;
+// The user has toggled an account since this Settings page was drawn. Automatic
+// re-renders stand down until it is reopened: a row that disappears under the
+// pointer that just restored it is the very complaint behind #57.
+let settingsTouched = false;
 
 function accountKey(acc) {
   return `${acc.provider}/${acc.account}`;
@@ -227,15 +273,57 @@ function accountLabel(acc) {
   return generic ? providerLabel(acc.provider) : name;
 }
 
-// Accounts the settings page lists: everything the server currently reports, plus
-// hidden accounts it no longer does (signed out, renamed, removed upstream). Without
-// the latter a hidden account that vanished upstream could never be re-enabled (#52).
+// Accounts the settings page lists: every connection OmniRoute knows about — idle
+// and inactive ones included, which is why the backend stopped dropping them (#57) —
+// plus hidden keys it no longer reports at all (deleted upstream). Without both, a
+// hidden account that stops reporting usage could never be re-enabled (#52).
 function settingsAccounts() {
   const seen = new Set(rateLimitCache.map(accountKey));
   const orphans = [...hiddenAccounts]
     .filter((key) => !seen.has(key))
-    .map((key) => ({ ...parseAccountKey(key), windows: [], missing: true }));
+    .map((key) => ({
+      ...parseAccountKey(key),
+      windows: [],
+      active: false,
+      missing: true,
+    }));
   return [...rateLimitCache, ...orphans];
+}
+
+// Why a settings row is not in the Usage list. Every case stays listed and tickable:
+// the hidden state must be reversible even when the account reports nothing (#57).
+function accountStatus(acc) {
+  if (acc.missing) {
+    return {
+      text: "not reported",
+      tip: "OmniRoute no longer lists this account. Tick it to drop the hidden state.",
+    };
+  }
+  if (acc.active === false) {
+    return {
+      text: "inactive",
+      tip: "Disabled in OmniRoute, so it reports no usage.",
+    };
+  }
+  if (acc.usage_unavailable) {
+    // With windows it is still in the Usage list, on carried-over numbers.
+    return acc.windows && acc.windows.length
+      ? {
+          text: "last known",
+          tip: "OmniRoute did not answer the latest usage lookup; showing the last values it returned.",
+        }
+      : {
+          text: "usage unavailable",
+          tip: "OmniRoute did not answer the usage lookup for this account. Often transient.",
+        };
+  }
+  if (!acc.windows || !acc.windows.length) {
+    return {
+      text: "no usage",
+      tip: "OmniRoute reports no usage window for this account yet.",
+    };
+  }
+  return null;
 }
 
 function saveOrder() {
@@ -268,6 +356,23 @@ function groupByProvider(accounts) {
 }
 
 let rateLimitCache = [];
+// The skeleton stands for "not fetched yet". Once a fetch has landed, an empty list
+// is an answer — OmniRoute has no connections — and must not keep faking a load.
+let rateLimitsLoaded = false;
+// Bumped by every accepted account payload. A fetch captures it before awaiting and
+// drops its answer if anything landed meanwhile, so an older response — a second
+// Settings visit, a poll crossing a `quota-refreshed` — cannot overwrite newer
+// accounts or repaint the page from them.
+let accountsEpoch = 0;
+
+function acceptAccounts(data, epoch) {
+  if (!Array.isArray(data)) return false;
+  rateLimitsLoaded = true;
+  if (epoch !== accountsEpoch) return false;
+  rateLimitCache = data;
+  accountsEpoch += 1;
+  return true;
+}
 
 // ---- provider marks ----
 // Beyond the few marks bundled in icons.js, the local OmniRoute dashboard serves
@@ -687,13 +792,17 @@ function saveHiddenAccounts() {
 
 async function renderRateLimits() {
   const section = document.getElementById("ratelimits");
-  if (!rateLimitCache.length) {
+  if (!section) return; // Settings replaced the main view mid-poll
+  if (!rateLimitCache.length && !rateLimitsLoaded) {
     section.innerHTML = usageSkeleton();
   }
+  const epoch = accountsEpoch;
   try {
-    const data = await invoke("get_rate_limits");
-    if (Array.isArray(data)) rateLimitCache = data;
+    acceptAccounts(await invoke("get_rate_limits"), epoch);
+    // The cache is always worth updating; the DOM below may be gone by now.
+    if (!document.getElementById("ratelimits")) return;
   } catch (err) {
+    if (!document.getElementById("ratelimits")) return;
     if (!rateLimitCache.length) {
       // Nothing to fall back on: say why instead of spinning forever (#42).
       section.innerHTML = `<div class="section-head"><h3>Usage</h3></div>
@@ -715,14 +824,21 @@ function usageSkeleton() {
 
 function paintRateLimits() {
   const section = document.getElementById("ratelimits");
+  // The fetch in front of this one may have outlived the main view.
+  if (!section) return;
   if (!rateLimitCache.length) {
-    section.innerHTML = usageSkeleton();
+    section.innerHTML = rateLimitsLoaded
+      ? `<div class="section-head"><h3>Usage</h3></div><p class="placeholder">No accounts connected to OmniRoute.</p>`
+      : usageSkeleton();
     return;
   }
   const toggle = `<button id="mode-toggle" class="mode-toggle">${
     showUsed ? "% used" : "% left"
   }</button>`;
-  const groups = groupByProvider(rateLimitCache)
+  // The cache now carries every connection, idle ones included (#57); only those
+  // with a usage window have anything to draw here.
+  const reporting = rateLimitCache.filter((a) => a.windows && a.windows.length);
+  const groups = groupByProvider(reporting)
     .map(([provider, accts]) => {
       const visible = accts.filter((a) => !hiddenAccounts.has(accountKey(a)));
       return [provider, visible];
@@ -730,7 +846,10 @@ function paintRateLimits() {
     .filter(([, visible]) => visible.length);
 
   if (!groups.length) {
-    section.innerHTML = `<div class="section-head"><h3>Usage</h3>${toggle}</div><p class="placeholder">All accounts hidden. Enable in settings.</p>`;
+    const note = reporting.length
+      ? "All accounts hidden. Enable in settings."
+      : "No account is reporting usage yet.";
+    section.innerHTML = `<div class="section-head"><h3>Usage</h3>${toggle}</div><p class="placeholder">${note}</p>`;
     wireModeToggle();
     return;
   }
@@ -1021,12 +1140,21 @@ async function renderTrend() {
   wireSparkline();
 }
 
-async function renderSettings() {
+// `automatic` marks a render nobody asked for (data arriving late). Those stand
+// down as soon as the page is the user's; Show all and reordering are explicit and
+// always redraw from the current state.
+async function renderSettings({ automatic = false } = {}) {
   const content = document.getElementById("content");
   let autostart = false;
   try {
     autostart = await invoke("get_autostart");
   } catch {}
+  // Background callers make this reachable at any time, and the user may have left
+  // Settings — or touched a row — during that await. A late render would paint
+  // Settings over the main view, or pull a just-restored row out from under them.
+  if (!inSettings) return;
+  if (automatic && settingsTouched) return;
+  settingsNeedsAccounts = !rateLimitCache.length;
 
   const groups = groupByProvider(settingsAccounts());
   const providers = groups.map(([p]) => p);
@@ -1037,13 +1165,14 @@ async function renderSettings() {
         .map((acc) => {
           const key = accountKey(acc);
           const checked = hiddenAccounts.has(key) ? "" : "checked";
-          const missing = acc.missing
-            ? `<span class="set-hint" title="OmniRoute no longer reports this account. Re-tick it to forget the hidden state.">not reported</span>`
+          const status = accountStatus(acc);
+          const hint = status
+            ? `<span class="set-hint" title="${escapeHtml(status.tip)}">${escapeHtml(status.text)}</span>`
             : "";
           return `
-            <label class="set-acct${acc.missing ? " set-missing" : ""}">
+            <label class="set-acct${status ? " set-quiet" : ""}">
               <input type="checkbox" class="set-check" data-key="${escapeHtml(key)}" ${checked} />
-              <span class="acct-name">${escapeHtml(acc.account)}</span>${missing}
+              <span class="acct-name">${escapeHtml(acc.account)}</span>${hint}
             </label>`;
         })
         .join("");
@@ -1132,10 +1261,12 @@ async function renderSettings() {
   }
   content.querySelectorAll(".set-check").forEach((c) => {
     c.onchange = () => {
+      settingsTouched = true;
       setAccountHidden(c.dataset.key, !c.checked);
-      // A row that only existed because it was hidden has nothing left to show.
-      if (c.checked && c.closest(".set-missing")) renderSettings();
-      else if (showAllBtn) showAllBtn.hidden = hiddenAccounts.size === 0;
+      // No re-render: a row must not vanish under the pointer that just ticked it.
+      // Re-enabling an account OmniRoute no longer reports has to look like it took
+      // effect, even though nothing can come back in the Usage list (#57).
+      if (showAllBtn) showAllBtn.hidden = hiddenAccounts.size === 0;
     };
   });
   content.querySelectorAll(".move-btn").forEach((b) => {
@@ -1305,7 +1436,14 @@ let lastHeight = 0;
 function fitWindow() {
   const app = document.getElementById("app");
   if (!app) return;
-  const height = Math.min(620, app.offsetHeight + 16);
+  // #app is capped at the viewport so long lists scroll instead of being clipped,
+  // which also means its measured height can never ask for a taller window. The
+  // height we want is the fixed chrome plus everything inside the scroller.
+  const content = document.getElementById("content");
+  const natural = content
+    ? app.offsetHeight - content.clientHeight + content.scrollHeight
+    : app.offsetHeight;
+  const height = Math.min(620, Math.ceil(natural) + 16);
   if (height === lastHeight) return;
   lastHeight = height;
   getCurrentWindow()
@@ -1316,8 +1454,22 @@ function fitWindow() {
 getCurrentWindow().listen("run-doctor", runDoctor);
 
 getCurrentWindow().listen("quota-refreshed", (event) => {
-  if (Array.isArray(event.payload)) rateLimitCache = event.payload;
-  if (!inSettings) paintRateLimits();
+  if (Array.isArray(event.payload)) {
+    rateLimitCache = event.payload;
+    rateLimitsLoaded = true;
+    accountsEpoch += 1; // supersedes anything currently in flight
+  }
+  if (!inSettings) {
+    paintRateLimits();
+    return;
+  }
+  // Settings opened before any account data arrived (a failed first fetch, or the
+  // credential-less window on a fresh install) shows an empty list, and nothing
+  // else repaints it while it is open. Fill it in — but only then: re-rendering
+  // under the pointer is the other half of #57.
+  if (settingsNeedsAccounts && rateLimitCache.length && !settingsTouched) {
+    renderSettings({ automatic: true });
+  }
 });
 
 const gearBtn = document.getElementById("gear-btn");
