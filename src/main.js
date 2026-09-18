@@ -59,6 +59,10 @@ async function refresh() {
     noteServerVersion(status.version);
     renderHeader(status);
     if (inSettings) {
+      // This 5s loop is the only thing still running while Settings is open; the
+      // server-side quota thread first fires 5 minutes in, which is no way to
+      // recover a Settings page whose own fetch failed.
+      if (settingsNeedsAccounts) await fillSettingsAccounts();
       return;
     }
     renderUpdate(status);
@@ -110,12 +114,28 @@ async function toggleSettings() {
     await renderSettings();
     if (content) content.scrollTop = 0;
   } else {
+    settingsNeedsAccounts = false;
     document.getElementById("content").innerHTML = mainContentHTML();
     paintRateLimits();
     fitWindow();
     await refresh();
   }
   fitWindow();
+}
+
+// Retry the accounts behind an empty Settings page until one lands.
+async function fillSettingsAccounts() {
+  let data;
+  try {
+    data = await invoke("get_rate_limits");
+  } catch {
+    return; // still unavailable; the next tick tries again
+  }
+  if (!Array.isArray(data)) return;
+  rateLimitsLoaded = true;
+  if (!data.length) return;
+  rateLimitCache = data;
+  await renderSettings();
 }
 
 function mainContentHTML() {
@@ -158,7 +178,11 @@ function renderHeader(status) {
   document.getElementById("version").textContent = status.version
     ? `v${status.version}`
     : "";
+  // The error slot belongs to the main view; Settings replaces the whole content
+  // element. Without this the poll threw here on every tick while Settings was
+  // open, taking the rest of refresh() — including the header — down with it.
   const errEl = document.getElementById("error");
+  if (!errEl) return;
   if (status.state === "error" && status.reason) {
     const reason = status.reason.replace(
       /View Logs/g,
@@ -198,6 +222,10 @@ let hiddenAccounts = new Set(
 );
 let accountOrder = JSON.parse(localStorage.getItem("accountOrder") || "[]");
 let inSettings = false;
+// Settings is open on a list the server has not contributed to yet. Hidden orphan
+// rows can fill that list on their own, so the flag — not the presence of a row —
+// is what says the live accounts are still missing.
+let settingsNeedsAccounts = false;
 
 function accountKey(acc) {
   return `${acc.provider}/${acc.account}`;
@@ -1085,6 +1113,7 @@ async function renderTrend() {
 
 async function renderSettings() {
   const content = document.getElementById("content");
+  settingsNeedsAccounts = !rateLimitCache.length;
   let autostart = false;
   try {
     autostart = await invoke("get_autostart");
@@ -1397,11 +1426,9 @@ getCurrentWindow().listen("quota-refreshed", (event) => {
   }
   // Settings opened before any account data arrived (a failed first fetch, or the
   // credential-less window on a fresh install) shows an empty list, and nothing
-  // else repaints it while it is open. Fill it in — but only while it is empty:
-  // re-rendering under the pointer is the other half of #57.
-  if (rateLimitCache.length && !document.querySelector(".set-check")) {
-    renderSettings();
-  }
+  // else repaints it while it is open. Fill it in — but only then: re-rendering
+  // under the pointer is the other half of #57.
+  if (settingsNeedsAccounts && rateLimitCache.length) renderSettings();
 });
 
 const gearBtn = document.getElementById("gear-btn");
