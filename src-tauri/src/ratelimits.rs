@@ -32,6 +32,10 @@ pub struct AccountLimits {
     /// usage, but it still exists — Settings lists it so its hidden state stays
     /// togglable (#57).
     pub active: bool,
+    /// The usage lookup for this account failed (network, auth, bad JSON). Kept
+    /// apart from an empty `windows`, so a broken account is not mislabelled as
+    /// an idle one.
+    pub usage_unavailable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -51,19 +55,22 @@ pub fn fetch(base_url: &str, creds: &Credentials) -> Result<Vec<AccountLimits>, 
     // an account that drops out of it can never be un-hidden again (#52, #57).
     let mut result = Vec::new();
     for conn in connections {
-        let windows = if conn.active {
-            get(base_url, &format!("/api/usage/{}", conn.id), creds)
-                .ok()
-                .and_then(|raw| parse_usage(&raw).ok())
-                .unwrap_or_default()
+        let (windows, usage_unavailable) = if conn.active {
+            match get(base_url, &format!("/api/usage/{}", conn.id), creds)
+                .and_then(|raw| parse_usage(&raw))
+            {
+                Ok(windows) => (windows, false),
+                Err(_) => (Vec::new(), true),
+            }
         } else {
-            Vec::new()
+            (Vec::new(), false)
         };
         result.push(AccountLimits {
             account: conn.name,
             provider: conn.provider,
             windows,
             active: conn.active,
+            usage_unavailable,
         });
     }
     Ok(result)

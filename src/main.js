@@ -260,6 +260,12 @@ function accountStatus(acc) {
       tip: "Disabled in OmniRoute, so it reports no usage.",
     };
   }
+  if (acc.usage_unavailable) {
+    return {
+      text: "usage unavailable",
+      tip: "OmniRoute did not answer the usage lookup for this account. Often transient.",
+    };
+  }
   if (!acc.windows || !acc.windows.length) {
     return {
       text: "no usage",
