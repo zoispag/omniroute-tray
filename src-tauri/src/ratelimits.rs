@@ -208,10 +208,21 @@ pub fn parse_usage(raw: &str) -> Result<Vec<Window>, RateLimitError> {
             )));
         }
         let unlimited = q.get("unlimited").and_then(Value::as_bool).unwrap_or(false);
+        // An entry carrying no usable numbers is not a window at 0% either — that
+        // paints a reassuring full bar. An unlimited window has nothing to count.
+        let used_percent = match used_percent_of(q) {
+            Some(pct) => pct,
+            None if unlimited => 0.0,
+            None => {
+                return Err(RateLimitError::Parse(format!(
+                    "quota `{key}` carried no usable numbers"
+                )))
+            }
+        };
         windows.push(Window {
             label: pretty_label(key),
             short: short_label(key),
-            used_percent: used_percent_of(q),
+            used_percent,
             reset_at: q.get("resetAt").and_then(Value::as_str).map(str::to_string),
             unlimited,
         });
@@ -225,19 +236,22 @@ pub fn parse_usage(raw: &str) -> Result<Vec<Window>, RateLimitError> {
     Ok(windows)
 }
 
-fn used_percent_of(q: &Value) -> f64 {
+/// `None` when the entry holds neither a usable `remainingPercentage` nor a
+/// `used`/`total` pair — the caller decides whether that is a broken window or
+/// simply one with nothing to count.
+fn used_percent_of(q: &Value) -> Option<f64> {
     if let Some(rem) = q.get("remainingPercentage").and_then(Value::as_f64) {
-        return clamp(100.0 - rem);
+        return Some(clamp(100.0 - rem));
     }
     if let (Some(used), Some(total)) = (
         q.get("used").and_then(Value::as_f64),
         q.get("total").and_then(Value::as_f64),
     ) {
         if total > 0.0 {
-            return clamp(used / total * 100.0);
+            return Some(clamp(used / total * 100.0));
         }
     }
-    0.0
+    None
 }
 
 fn short_label(key: &str) -> String {
@@ -281,7 +295,9 @@ fn aggregate_per_model(quotas: &serde_json::Map<String, Value>) -> Vec<Window> {
         let Some(reset) = q.get("resetAt").and_then(Value::as_str) else {
             continue;
         };
-        let used = used_percent_of(q);
+        let Some(used) = used_percent_of(q) else {
+            continue;
+        };
         let unlimited = q.get("unlimited").and_then(Value::as_bool).unwrap_or(false);
         let entry = groups.entry(reset.to_string()).or_insert((0.0, true));
         if used > entry.0 {
@@ -449,6 +465,22 @@ mod tests {
         for raw in ["[]", "null", r#""nope""#, "7"] {
             assert!(parse_usage(raw).is_err(), "accepted {raw}");
         }
+    }
+
+    #[test]
+    fn window_without_usable_numbers_is_an_error_unless_it_is_unlimited() {
+        assert!(parse_usage(r#"{"quotas":{"session (5h)":{}}}"#).is_err());
+        assert!(
+            parse_usage(r#"{"quotas":{"session (5h)":{"remainingPercentage":"73"}}}"#).is_err(),
+            "a string percentage is not a number"
+        );
+        assert!(
+            parse_usage(r#"{"quotas":{"session (5h)":{"used":5,"total":0}}}"#).is_err(),
+            "a zero total cannot yield a percentage"
+        );
+        let unlimited = parse_usage(r#"{"quotas":{"weekly (7d)":{"unlimited":true}}}"#).unwrap();
+        assert_eq!(unlimited.len(), 1);
+        assert_eq!(unlimited[0].used_percent, 0.0);
     }
 
     #[test]
