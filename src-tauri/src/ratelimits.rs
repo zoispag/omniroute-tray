@@ -60,7 +60,7 @@ pub fn fetch(base_url: &str, creds: &Credentials) -> Result<Vec<AccountLimits>, 
     let mut result = Vec::new();
     for conn in connections {
         let (windows, usage_unavailable) = if conn.active {
-            match get(base_url, &format!("/api/usage/{}", &conn.id), creds)
+            match get(base_url, &format!("/api/usage/{}", conn.id), creds)
                 .and_then(|raw| parse_usage(&raw))
             {
                 Ok(windows) => (windows, false),
