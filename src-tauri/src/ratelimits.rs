@@ -94,8 +94,14 @@ pub struct ProbeLog {
 
 #[derive(Debug, Clone, PartialEq)]
 struct Probe {
+    /// When the last probe completed (or, for a never-completed entry, when it
+    /// was first reserved).
     at: Instant,
-    outcome: ProbeOutcome,
+    /// Outcome of the last COMPLETED probe. A reservation does not touch it, so
+    /// the label an account carries survives an in-flight retry.
+    outcome: Option<ProbeOutcome>,
+    /// Set while a fetch is probing this account off the lock.
+    reserved_at: Option<Instant>,
     /// Windows from the last probe that returned numbers, kept across failures
     /// and dropped once the provider is confirmed to have no usage API.
     windows: Option<Vec<Window>>,
@@ -103,8 +109,6 @@ struct Probe {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ProbeOutcome {
-    /// Reserved by a fetch that is about to probe it off the lock.
-    Pending,
     /// `/api/usage/<id>` returned fresh numbers.
     Fresh,
     /// OmniRoute could not reach the provider and served its own previous entry
@@ -122,26 +126,30 @@ impl ProbeLog {
             None => true,
             Some(p) => {
                 let gap = match p.outcome {
-                    ProbeOutcome::Unsupported => UNSUPPORTED_RECHECK,
+                    Some(ProbeOutcome::Unsupported) => UNSUPPORTED_RECHECK,
                     _ => PROBE_GAP,
                 };
-                now.duration_since(p.at) >= gap
+                // A reservation counts like an attempt: an overlapping fetch waits
+                // for it, and an abandoned one expires after the same gap.
+                let last = p.reserved_at.map_or(p.at, |r| r.max(p.at));
+                now.duration_since(last) >= gap
             }
         }
     }
 
     /// Claim `ids` for a probe that is about to run without the lock, so an
-    /// overlapping fetch does not probe the same accounts. The previous outcome's
-    /// numbers are kept; only the timestamp and the in-flight marker change.
+    /// overlapping fetch does not probe the same accounts. The last completed
+    /// outcome and its numbers are untouched — they keep labelling the account
+    /// until the retry actually finishes.
     fn reserve(&mut self, ids: &[String], now: Instant) {
         for id in ids {
             let entry = self.entries.entry(id.clone()).or_insert(Probe {
                 at: now,
-                outcome: ProbeOutcome::Pending,
+                outcome: None,
+                reserved_at: None,
                 windows: None,
             });
-            entry.at = now;
-            entry.outcome = ProbeOutcome::Pending;
+            entry.reserved_at = Some(now);
         }
     }
 
@@ -156,11 +164,13 @@ impl ProbeLog {
     ) {
         let entry = self.entries.entry(id.to_string()).or_insert(Probe {
             at: now,
-            outcome,
+            outcome: None,
+            reserved_at: None,
             windows: None,
         });
         entry.at = now;
-        entry.outcome = outcome;
+        entry.outcome = Some(outcome);
+        entry.reserved_at = None;
         match outcome {
             ProbeOutcome::Unsupported => entry.windows = None,
             _ => {
@@ -171,17 +181,17 @@ impl ProbeLog {
         }
     }
 
-    /// The last probe did not produce fresh numbers.
+    /// The last completed probe did not produce fresh numbers.
     fn unavailable(&self, id: &str) -> bool {
         matches!(
-            self.entries.get(id).map(|p| p.outcome),
+            self.entries.get(id).and_then(|p| p.outcome),
             Some(ProbeOutcome::Failed | ProbeOutcome::Stale)
         )
     }
 
     fn unsupported(&self, id: &str) -> bool {
         matches!(
-            self.entries.get(id).map(|p| p.outcome),
+            self.entries.get(id).and_then(|p| p.outcome),
             Some(ProbeOutcome::Unsupported)
         )
     }
@@ -238,7 +248,11 @@ pub fn fetch(
 
     let mut usage: HashMap<String, CachedUsage> = HashMap::new();
     for conn in &connections {
-        if let Some(entry) = cached.as_ref().and_then(|c| c.get(&conn.id)) {
+        if let Some(entry) = cached
+            .as_ref()
+            .and_then(|c| c.get(&conn.id))
+            .filter(|e| !is_error_only_entry(e))
+        {
             // An entry we cannot read is treated like no entry: the live probe
             // decides, and failing that the account is flagged, not blanked.
             if let Ok(windows) = windows_from_body(entry) {
@@ -327,12 +341,12 @@ pub fn fetch(
         // Flagged when the tray's own last look failed AND nothing fresher has
         // landed in OmniRoute's cache since (the dashboard or the scheduler may
         // have refreshed it) — a fresh entry is good data whoever fetched it —
-        // or when the cache could not be read and no probe has numbers for this
-        // account yet, so the caller carries over its last known windows.
+        // or when no source has numbers for this account yet (no usable cache
+        // entry, no probe so far), so the caller carries over its last known
+        // windows instead of reading the gap as "no usage".
         let no_numbers = windows.is_none();
-        let usage_unavailable = conn.active
-            && !fresh
-            && (log.unavailable(&conn.id) || (cached.is_none() && no_numbers && !unsupported));
+        let usage_unavailable =
+            conn.active && !fresh && (log.unavailable(&conn.id) || (no_numbers && !unsupported));
         result.push(AccountLimits {
             id: conn.id,
             account: conn.name,
@@ -460,6 +474,19 @@ fn parse_provider_limits(
         .iter()
         .filter_map(|(id, entry)| entry.as_object().map(|e| (id.clone(), e.clone())))
         .collect())
+}
+
+/// OmniRoute persists an error-only entry (`quotas: null` plus a `message`) when a
+/// refresh failed and there was no earlier good entry to keep. That is a failed
+/// lookup, not an account without usage: treat it as no entry, so it gets probed
+/// and, failing that, flagged. A `quotas: null` with no message is a real answer.
+fn is_error_only_entry(entry: &serde_json::Map<String, Value>) -> bool {
+    let has_quotas = entry.get("quotas").is_some_and(Value::is_object);
+    let has_message = entry
+        .get("message")
+        .and_then(Value::as_str)
+        .is_some_and(|m| !m.trim().is_empty());
+    !has_quotas && has_message
 }
 
 /// Milliseconds since the entry's `fetchedAt`; `None` when it carries none we can read.
@@ -1252,6 +1279,46 @@ mod tests {
             log.may_probe("a", now + PROBE_GAP * 2),
             "an abandoned reservation expires"
         );
+    }
+
+    #[test]
+    fn an_error_only_cache_entry_is_not_an_answer() {
+        let caches = parse_provider_limits(PROVIDER_LIMITS).unwrap();
+        assert!(!is_error_only_entry(&caches["claude-1"]));
+        assert!(
+            is_error_only_entry(&caches["codex-1"]),
+            "quotas null + message = a failed refresh OmniRoute persisted, not \"no usage\""
+        );
+        let no_quotas: serde_json::Map<String, Value> = serde_json::from_str(
+            r#"{"quotas":null,"message":null,"fetchedAt":"2026-09-18T15:00:00Z"}"#,
+        )
+        .unwrap();
+        assert!(
+            !is_error_only_entry(&no_quotas),
+            "no quotas and no message is a real answer"
+        );
+    }
+
+    #[test]
+    fn a_reservation_does_not_erase_the_last_outcome() {
+        let now = Instant::now();
+        let mut log = ProbeLog::default();
+        log.record("f", ProbeOutcome::Failed, None, now);
+        log.record("u", ProbeOutcome::Unsupported, None, now);
+        log.reserve(&["f".to_string()], now + PROBE_GAP);
+        assert!(
+            log.unavailable("f"),
+            "still flagged while the retry is in flight"
+        );
+        assert!(!log.may_probe("f", now + PROBE_GAP + secs(1)));
+        log.record(
+            "f",
+            ProbeOutcome::Fresh,
+            Some(Vec::new()),
+            now + PROBE_GAP + secs(2),
+        );
+        assert!(!log.unavailable("f"), "the completed retry clears it");
+        assert!(log.unsupported("u"), "untouched accounts keep theirs");
     }
 
     #[test]
