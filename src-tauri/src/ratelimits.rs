@@ -1198,7 +1198,8 @@ mod tests {
     #[test]
     fn entry_age_comes_from_fetched_at() {
         let caches = parse_provider_limits(PROVIDER_LIMITS).unwrap();
-        let fetched = chrono_parse_millis("2026-09-18T15:34:45Z").unwrap();
+        // The fixture's `fetchedAt` carries a fraction; the age must be exact.
+        let fetched = chrono_parse_millis("2026-09-18T15:34:45.854Z").unwrap();
         assert_eq!(
             entry_age_ms(&caches["claude-1"], fetched + 30_000),
             Some(30_000)
