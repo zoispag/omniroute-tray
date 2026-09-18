@@ -114,14 +114,23 @@ fn get(base_url: &str, path: &str, creds: &Credentials) -> Result<String, RateLi
 fn parse_connections(raw: &str) -> Result<Vec<Connection>, RateLimitError> {
     let value: Value =
         serde_json::from_str(raw).map_err(|e| RateLimitError::Parse(e.to_string()))?;
-    // OmniRoute has served this both as a flat array and wrapped in `connections`;
-    // `health.rs` already tolerates both, and reading the wrong one here empties
-    // the account list Settings depends on.
-    let arr = value
+    // OmniRoute has served this both as a flat array and wrapped in `connections`
+    // (`health.rs` tolerates `providers` as well), and reading the wrong one here
+    // empties the account list Settings depends on. Anything else is a broken
+    // response, not "no accounts": erroring keeps the last-known list, since an
+    // empty success would overwrite the cache and hide every account.
+    let arr = match value
         .as_array()
         .or_else(|| value.get("connections").and_then(Value::as_array))
-        .cloned()
-        .unwrap_or_default();
+        .or_else(|| value.get("providers").and_then(Value::as_array))
+    {
+        Some(arr) => arr.clone(),
+        None => {
+            return Err(RateLimitError::Parse(
+                "/api/providers held no connections array".to_string(),
+            ))
+        }
+    };
 
     let mut connections = Vec::new();
     for c in &arr {
@@ -547,6 +556,19 @@ mod tests {
             assert_eq!(conns.len(), 1, "shape: {raw}");
             assert_eq!(conns[0].provider, "claude");
         }
+    }
+
+    #[test]
+    fn unsupported_provider_shape_is_an_error_not_an_empty_account_list() {
+        // An empty success would replace the cached accounts and hide them all.
+        assert!(parse_connections(r#"{"connections":{}}"#).is_err());
+        assert!(parse_connections(r#"{"other":[]}"#).is_err());
+        assert!(
+            parse_connections(r#"{"connections":[]}"#)
+                .unwrap()
+                .is_empty(),
+            "a genuinely empty list is still an answer"
+        );
     }
 
     #[test]
