@@ -1,15 +1,25 @@
 //! Keep the popover reachable from whatever the user is looking at (#58).
 //!
-//! An AppKit window lives on the space it was created on. The popover is built
-//! once, at launch, so it stayed bound to the space the app started on: clicking
-//! the tray icon while a full-screen app (or another desktop) was in front either
-//! did nothing visible or yanked the user back to the original space, even though
-//! the tray icon itself is on every space.
+//! Two things have to be true, and only one of them is a flag.
 //!
-//! Two collection-behaviour flags fix that, and `tao` only exposes the first:
-//! `CanJoinAllSpaces` puts the window on every desktop, and `FullScreenAuxiliary`
-//! lets it draw over another app's full-screen space (which is its own space, and
-//! otherwise only hosts that app's windows).
+//! **The window must be born into an accessory app.** A window created while the
+//! process is still a regular app is pinned to the space it was created on for
+//! the rest of its life, and no later `collectionBehavior` can move it. Measured
+//! side by side, two windows with identical flags and level: the one created
+//! under `.regular` and then switched to `.accessory` reports
+//! `isOnActiveSpace == false` on a full-screen space; the one created after the
+//! switch reports `true`. Tauri builds `"create": true` windows inside its own
+//! setup, before the `setup` hook where `set_activation_policy` runs, so the
+//! popover is declared `"create": false` and built by `build_popover` instead.
+//! (`LSUIElement` in `Info.plist` does not help: `tao` sets the policy back to
+//! regular when it creates the event loop, and the status item goes missing.)
+//!
+//! **And the window needs the right collection behaviour**, which is what this
+//! module sets: `CanJoinAllSpaces` puts it on every desktop, `FullScreenAuxiliary`
+//! lets it draw over another app's full-screen space (its own space, which
+//! otherwise hosts only that app's windows). `tao` exposes the first only, via
+//! `set_visible_on_all_workspaces`. On its own — the state shipped in v0.1.19 —
+//! this changes nothing at all, because of the binding above.
 
 #[cfg(target_os = "macos")]
 use objc2_app_kit::NSWindowCollectionBehavior;

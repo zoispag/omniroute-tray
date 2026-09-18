@@ -432,10 +432,16 @@ fn credentials_for_request(app: &tauri::AppHandle) -> Credentials {
     fresh
 }
 
-/// Rebuild the popover from its config. Only needed if the window was destroyed
-/// out from under us — we survive that now (see `RunEvent::ExitRequested`), and a
-/// tray whose popover never opens again would be worse than the crash it replaced.
-fn recreate_popover(app: &tauri::AppHandle) -> Option<tauri::WebviewWindow> {
+/// Build the popover from its config.
+///
+/// The window is declared `"create": false` and built here instead, because it
+/// must not exist before `setup` has made this an accessory app: a window born
+/// while the process is still a regular app is pinned to the space it was
+/// created on for life (#58, see `spaces`). Also used to recover a window that
+/// was destroyed out from under us — we survive that now (see
+/// `RunEvent::ExitRequested`), and a tray whose popover never opens again would
+/// be worse than the crash it replaced.
+fn build_popover(app: &tauri::AppHandle) -> Option<tauri::WebviewWindow> {
     let config = app
         .config()
         .app
@@ -443,13 +449,18 @@ fn recreate_popover(app: &tauri::AppHandle) -> Option<tauri::WebviewWindow> {
         .iter()
         .find(|w| w.label == POPOVER_LABEL)?
         .clone();
-    log::warn!("popover window was gone; rebuilding it");
     let window = tauri::WebviewWindowBuilder::from_config(app, &config)
         .ok()?
         .build()
         .ok()?;
     spaces::follow_active_space(&window);
     Some(window)
+}
+
+/// The popover, rebuilt if it has gone missing.
+fn recreate_popover(app: &tauri::AppHandle) -> Option<tauri::WebviewWindow> {
+    log::warn!("popover window was gone; rebuilding it");
+    build_popover(app)
 }
 
 fn toggle_popover(app: &tauri::AppHandle) {
@@ -805,14 +816,14 @@ pub fn run() {
             }
             app.handle().plugin(logger.build())?;
 
+            // Before the popover exists, and never after: the window inherits
+            // the app's space binding from the policy in force when it is built
+            // (#58, see `spaces`).
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-            if let Some(window) = app.get_webview_window(POPOVER_LABEL) {
-                // The popover is built once and never moves, so without this it
-                // stays on the space the app launched on (#58).
-                spaces::follow_active_space(&window);
-                let _ = window.hide();
+            if build_popover(app.handle()).is_none() {
+                log::error!("could not build the popover window");
             }
 
             let tray_icon =
