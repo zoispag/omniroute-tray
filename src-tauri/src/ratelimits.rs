@@ -588,6 +588,16 @@ fn parse_live(raw: &str) -> Result<LiveUsage, RateLimitError> {
             "usage response was not an object".to_string(),
         ));
     };
+    // A 200 with `quotas: null` and a `message` is how OmniRoute reports a failed
+    // provider lookup when it has no earlier entry to fall back on. Same rule as
+    // for cached entries: that is a failed probe, not an account with no usage.
+    if is_error_only_entry(body) {
+        let message = body
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("provider lookup failed");
+        return Err(RateLimitError::Network(format!("OmniRoute: {message}")));
+    }
     Ok(LiveUsage {
         windows: windows_from_body(body)?,
         stale: body.get("_stale").and_then(Value::as_bool).unwrap_or(false),
@@ -1234,6 +1244,21 @@ mod tests {
         assert!(live.stale);
         assert_eq!(live.windows.len(), 2, "stale numbers are still numbers");
         assert!(!parse_live(USAGE).unwrap().stale);
+    }
+
+    #[test]
+    fn an_error_only_live_body_is_a_failed_probe_not_empty_usage() {
+        let raw = r#"{"quotas":null,"plan":null,"message":"Claude connected. Usage API requires admin permissions."}"#;
+        assert!(
+            matches!(parse_live(raw), Err(RateLimitError::Network(m)) if m.contains("admin permissions")),
+            "a 200 carrying only an error message must not read as \"no usage\""
+        );
+        let no_quotas_no_message = r#"{"quotas":null,"plan":null,"message":null}"#;
+        let live = parse_live(no_quotas_no_message).unwrap();
+        assert!(
+            live.windows.is_empty(),
+            "no quotas and no message is a real empty answer"
+        );
     }
 
     #[test]
