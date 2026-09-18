@@ -38,6 +38,10 @@ body {
   overflow: hidden;
   border: 1px solid var(--border);
   margin: 6px;
+  /* fitWindow() caps the window at 620px. Without this the surplus was simply
+     clipped by `overflow: hidden` above, so a long Settings list ran off the
+     bottom with nothing to scroll and its controls became unreachable (#57). */
+  max-height: calc(100vh - 12px);
 }
 
 .popover-header {
@@ -92,6 +96,24 @@ body {
 
 .popover-content {
   padding: 6px 16px 14px;
+  /* The scroll lives here so the header and footer stay put. */
+  overflow-y: auto;
+  min-height: 0;
+}
+
+/* Overlay scrollbars only appear once you already scroll; this slim one is the
+   only hint that there is more below. */
+.popover-content::-webkit-scrollbar {
+  width: 6px;
+}
+
+.popover-content::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.popover-content::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
 }
 
 .section:not(:empty) {
@@ -937,8 +959,9 @@ body {
   cursor: pointer;
 }
 
-/* Hidden account the server no longer reports: listed so it can still be re-enabled. */
-.set-acct.set-missing {
+/* An account with nothing to show in Usage — idle, inactive, or gone from OmniRoute.
+   Still listed, so its hidden state stays reversible (#57). */
+.set-acct.set-quiet {
   color: var(--text-faint);
 }
 

@@ -28,6 +28,10 @@ pub struct AccountLimits {
     pub account: String,
     pub provider: String,
     pub windows: Vec<Window>,
+    /// `isActive` on the OmniRoute connection. An inactive account reports no
+    /// usage, but it still exists — Settings lists it so its hidden state stays
+    /// togglable (#57).
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -35,27 +39,32 @@ struct Connection {
     id: String,
     provider: String,
     name: String,
+    active: bool,
 }
 
 pub fn fetch(base_url: &str, creds: &Credentials) -> Result<Vec<AccountLimits>, RateLimitError> {
     let providers_raw = get(base_url, "/api/providers", creds)?;
     let connections = parse_connections(&providers_raw)?;
 
+    // Every connection OmniRoute knows about is returned, windows or not. The
+    // popover only draws the ones with usage, but Settings needs the full list:
+    // an account that drops out of it can never be un-hidden again (#52, #57).
     let mut result = Vec::new();
     for conn in connections {
-        let usage_raw = match get(base_url, &format!("/api/usage/{}", conn.id), creds) {
-            Ok(body) => body,
-            Err(_) => continue,
+        let windows = if conn.active {
+            get(base_url, &format!("/api/usage/{}", conn.id), creds)
+                .ok()
+                .and_then(|raw| parse_usage(&raw).ok())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
         };
-        if let Ok(windows) = parse_usage(&usage_raw) {
-            if !windows.is_empty() {
-                result.push(AccountLimits {
-                    account: conn.name,
-                    provider: conn.provider,
-                    windows,
-                });
-            }
-        }
+        result.push(AccountLimits {
+            account: conn.name,
+            provider: conn.provider,
+            windows,
+            active: conn.active,
+        });
     }
     Ok(result)
 }
@@ -90,9 +99,6 @@ fn parse_connections(raw: &str) -> Result<Vec<Connection>, RateLimitError> {
             .or_else(|| c.get("enabled"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        if !active {
-            continue;
-        }
         let (Some(id), Some(provider)) = (
             c.get("id").and_then(Value::as_str),
             c.get("provider").and_then(Value::as_str),
@@ -109,6 +115,7 @@ fn parse_connections(raw: &str) -> Result<Vec<Connection>, RateLimitError> {
             id: id.to_string(),
             provider: provider.to_string(),
             name,
+            active,
         });
     }
     Ok(connections)
@@ -420,13 +427,26 @@ mod tests {
     }
 
     #[test]
-    fn only_enabled_connections_selected() {
+    fn keeps_inactive_connections_and_flags_them() {
         let raw = r#"{"connections":[
           {"id":"a","provider":"claude","name":"me","isActive":true},
           {"id":"b","provider":"codex","name":"other","isActive":false}
         ]}"#;
         let conns = parse_connections(raw).unwrap();
+        assert_eq!(conns.len(), 2, "an inactive account still exists (#57)");
+        assert!(conns[0].active);
+        assert!(!conns[1].active);
+    }
+
+    #[test]
+    fn connection_without_id_or_provider_is_skipped() {
+        let raw = r#"{"connections":[
+          {"provider":"claude","name":"no id","isActive":true},
+          {"id":"b","name":"no provider","isActive":true},
+          {"id":"c","provider":"codex","name":"fine","isActive":true}
+        ]}"#;
+        let conns = parse_connections(raw).unwrap();
         assert_eq!(conns.len(), 1);
-        assert_eq!(conns[0].id, "a");
+        assert_eq!(conns[0].id, "c");
     }
 }

@@ -98,6 +98,7 @@ async function toggleSettings() {
     if (!rateLimitCache.length) {
       try {
         rateLimitCache = await invoke("get_rate_limits");
+        rateLimitsLoaded = true;
       } catch {}
     }
     document.getElementById("update").innerHTML = "";
@@ -227,15 +228,45 @@ function accountLabel(acc) {
   return generic ? providerLabel(acc.provider) : name;
 }
 
-// Accounts the settings page lists: everything the server currently reports, plus
-// hidden accounts it no longer does (signed out, renamed, removed upstream). Without
-// the latter a hidden account that vanished upstream could never be re-enabled (#52).
+// Accounts the settings page lists: every connection OmniRoute knows about — idle
+// and inactive ones included, which is why the backend stopped dropping them (#57) —
+// plus hidden keys it no longer reports at all (deleted upstream). Without both, a
+// hidden account that stops reporting usage could never be re-enabled (#52).
 function settingsAccounts() {
   const seen = new Set(rateLimitCache.map(accountKey));
   const orphans = [...hiddenAccounts]
     .filter((key) => !seen.has(key))
-    .map((key) => ({ ...parseAccountKey(key), windows: [], missing: true }));
+    .map((key) => ({
+      ...parseAccountKey(key),
+      windows: [],
+      active: false,
+      missing: true,
+    }));
   return [...rateLimitCache, ...orphans];
+}
+
+// Why a settings row is not in the Usage list. Every case stays listed and tickable:
+// the hidden state must be reversible even when the account reports nothing (#57).
+function accountStatus(acc) {
+  if (acc.missing) {
+    return {
+      text: "not reported",
+      tip: "OmniRoute no longer lists this account. Tick it to drop the hidden state.",
+    };
+  }
+  if (acc.active === false) {
+    return {
+      text: "inactive",
+      tip: "Disabled in OmniRoute, so it reports no usage.",
+    };
+  }
+  if (!acc.windows || !acc.windows.length) {
+    return {
+      text: "no usage",
+      tip: "OmniRoute reports no usage window for this account yet.",
+    };
+  }
+  return null;
 }
 
 function saveOrder() {
@@ -268,6 +299,9 @@ function groupByProvider(accounts) {
 }
 
 let rateLimitCache = [];
+// The skeleton stands for "not fetched yet". Once a fetch has landed, an empty list
+// is an answer — OmniRoute has no connections — and must not keep faking a load.
+let rateLimitsLoaded = false;
 
 // ---- provider marks ----
 // Beyond the few marks bundled in icons.js, the local OmniRoute dashboard serves
@@ -692,7 +726,10 @@ async function renderRateLimits() {
   }
   try {
     const data = await invoke("get_rate_limits");
-    if (Array.isArray(data)) rateLimitCache = data;
+    if (Array.isArray(data)) {
+      rateLimitCache = data;
+      rateLimitsLoaded = true;
+    }
   } catch (err) {
     if (!rateLimitCache.length) {
       // Nothing to fall back on: say why instead of spinning forever (#42).
@@ -716,13 +753,18 @@ function usageSkeleton() {
 function paintRateLimits() {
   const section = document.getElementById("ratelimits");
   if (!rateLimitCache.length) {
-    section.innerHTML = usageSkeleton();
+    section.innerHTML = rateLimitsLoaded
+      ? `<div class="section-head"><h3>Usage</h3></div><p class="placeholder">No accounts connected to OmniRoute.</p>`
+      : usageSkeleton();
     return;
   }
   const toggle = `<button id="mode-toggle" class="mode-toggle">${
     showUsed ? "% used" : "% left"
   }</button>`;
-  const groups = groupByProvider(rateLimitCache)
+  // The cache now carries every connection, idle ones included (#57); only those
+  // with a usage window have anything to draw here.
+  const reporting = rateLimitCache.filter((a) => a.windows && a.windows.length);
+  const groups = groupByProvider(reporting)
     .map(([provider, accts]) => {
       const visible = accts.filter((a) => !hiddenAccounts.has(accountKey(a)));
       return [provider, visible];
@@ -730,7 +772,10 @@ function paintRateLimits() {
     .filter(([, visible]) => visible.length);
 
   if (!groups.length) {
-    section.innerHTML = `<div class="section-head"><h3>Usage</h3>${toggle}</div><p class="placeholder">All accounts hidden. Enable in settings.</p>`;
+    const note = reporting.length
+      ? "All accounts hidden. Enable in settings."
+      : "No account is reporting usage yet.";
+    section.innerHTML = `<div class="section-head"><h3>Usage</h3>${toggle}</div><p class="placeholder">${note}</p>`;
     wireModeToggle();
     return;
   }
@@ -1037,13 +1082,14 @@ async function renderSettings() {
         .map((acc) => {
           const key = accountKey(acc);
           const checked = hiddenAccounts.has(key) ? "" : "checked";
-          const missing = acc.missing
-            ? `<span class="set-hint" title="OmniRoute no longer reports this account. Re-tick it to forget the hidden state.">not reported</span>`
+          const status = accountStatus(acc);
+          const hint = status
+            ? `<span class="set-hint" title="${escapeHtml(status.tip)}">${escapeHtml(status.text)}</span>`
             : "";
           return `
-            <label class="set-acct${acc.missing ? " set-missing" : ""}">
+            <label class="set-acct${status ? " set-quiet" : ""}">
               <input type="checkbox" class="set-check" data-key="${escapeHtml(key)}" ${checked} />
-              <span class="acct-name">${escapeHtml(acc.account)}</span>${missing}
+              <span class="acct-name">${escapeHtml(acc.account)}</span>${hint}
             </label>`;
         })
         .join("");
@@ -1133,9 +1179,10 @@ async function renderSettings() {
   content.querySelectorAll(".set-check").forEach((c) => {
     c.onchange = () => {
       setAccountHidden(c.dataset.key, !c.checked);
-      // A row that only existed because it was hidden has nothing left to show.
-      if (c.checked && c.closest(".set-missing")) renderSettings();
-      else if (showAllBtn) showAllBtn.hidden = hiddenAccounts.size === 0;
+      // No re-render: a row must not vanish under the pointer that just ticked it.
+      // Re-enabling an account OmniRoute no longer reports has to look like it took
+      // effect, even though nothing can come back in the Usage list (#57).
+      if (showAllBtn) showAllBtn.hidden = hiddenAccounts.size === 0;
     };
   });
   content.querySelectorAll(".move-btn").forEach((b) => {
@@ -1305,7 +1352,14 @@ let lastHeight = 0;
 function fitWindow() {
   const app = document.getElementById("app");
   if (!app) return;
-  const height = Math.min(620, app.offsetHeight + 16);
+  // #app is capped at the viewport so long lists scroll instead of being clipped,
+  // which also means its measured height can never ask for a taller window. The
+  // height we want is the fixed chrome plus everything inside the scroller.
+  const content = document.getElementById("content");
+  const natural = content
+    ? app.offsetHeight - content.clientHeight + content.scrollHeight
+    : app.offsetHeight;
+  const height = Math.min(620, Math.ceil(natural) + 16);
   if (height === lastHeight) return;
   lastHeight = height;
   getCurrentWindow()
