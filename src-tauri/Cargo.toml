@@ -6,7 +6,7 @@ authors = ["OmniRouteTray contributors"]
 license = "MIT"
 repository = "https://github.com/zoispag/omniroute-tray"
 edition = "2021"
-rust-version = "1.77.2"
+rust-version = "1.88.0"
 
 [lib]
 name = "omniroute_tray_lib"
