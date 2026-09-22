@@ -31,8 +31,8 @@ ureq = { version = "2", features = ["json"] }
 keyring = { version = "3", features = ["apple-native"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 chrono = "0.4"
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 hex = "0.4"
 
 # macOS 27 tray-click workaround (see src/traymenu.rs). Already in the tree via
