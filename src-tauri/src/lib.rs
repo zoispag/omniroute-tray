@@ -40,6 +40,10 @@ struct AppState {
     server: Mutex<ServerState>,
     data: Mutex<Option<DataClient>>,
     active_version: Mutex<Option<String>>,
+    /// The version the server on the port *reports* (`/api/monitoring/health`),
+    /// which differs from `active_version` for an adopted server the user runs
+    /// themselves. Refreshed by `monitor_health`; only `omniauth` needs it.
+    served_version: Mutex<Option<String>>,
     /// Bearer key + loopback CLI token presented on every management call.
     /// Resolved at bootstrap; the key is re-resolved lazily while it is still
     /// missing (a fresh install mints its first key only after the server
@@ -82,6 +86,7 @@ impl AppState {
             server: Mutex::new(ServerState::Stopped),
             data: Mutex::new(None),
             active_version: Mutex::new(None),
+            served_version: Mutex::new(None),
             auth: Mutex::new(Credentials::default()),
             supervisor: Mutex::new(None),
             pin_open: std::sync::atomic::AtomicBool::new(false),
@@ -241,6 +246,8 @@ fn bootstrap(app: tauri::AppHandle) {
                 Reconciliation::Adopt | Reconciliation::ReconcileForeign => true,
             };
             if ready {
+                *app.state::<AppState>().served_version.lock().unwrap() =
+                    supervisor::running_server(20128).and_then(|s| s.version);
                 set_state(
                     &app,
                     ServerState::Running {
@@ -278,8 +285,12 @@ fn monitor_health(app: tauri::AppHandle) {
         let mut consecutive_failures: u32 = 0;
         loop {
             std::thread::sleep(std::time::Duration::from_secs(5));
-            let responding = supervisor::server_responding(20128);
+            let probe = supervisor::probe_health(20128);
+            let responding = probe.is_some();
             let app_state = app.state::<AppState>();
+            if let Some(served) = probe.and_then(|p| p.version) {
+                *app_state.served_version.lock().unwrap() = Some(served);
+            }
             let current = app_state.server.lock().unwrap().clone();
             let version = app_state.active_version.lock().unwrap().clone();
             // Misses only count while the server is meant to be up. Starting,
@@ -424,15 +435,6 @@ fn resolve_cli_token(paths: &AppPaths, server_version: Option<&str>) -> Option<S
     )
 }
 
-/// The version the live server reports on `/api/monitoring/health`, if known.
-fn live_server_version(state: &AppState) -> Option<String> {
-    match &*state.server.lock().unwrap() {
-        ServerState::Running { version } => version.clone(),
-        ServerState::UpdateAvailable { current, .. } => Some(current.clone()),
-        _ => None,
-    }
-}
-
 /// Credentials for one data request. Blocking (touches disk), so call it from
 /// `spawn_blocking`.
 ///
@@ -449,7 +451,7 @@ fn credentials_for_request(app: &tauri::AppHandle) -> Credentials {
     let Ok(paths) = AppPaths::resolve(app) else {
         return cached;
     };
-    let version = live_server_version(&state);
+    let version = state.served_version.lock().unwrap().clone();
     let fresh = if cached.api_key.is_some() {
         Credentials {
             cli_token: resolve_cli_token(&paths, version.as_deref()),
