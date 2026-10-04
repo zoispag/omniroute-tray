@@ -53,6 +53,11 @@ impl AppPaths {
     pub fn omniroute_db_path(&self) -> PathBuf {
         dirs_home().join(".omniroute").join("storage.sqlite")
     }
+
+    /// Per-install CLI-token salt OmniRoute 3.8.51+ persists (see `omniauth`).
+    pub fn omniroute_cli_salt_path(&self) -> PathBuf {
+        dirs_home().join(".omniroute").join("cli-token-salt.json")
+    }
 }
 
 fn dirs_home() -> PathBuf {

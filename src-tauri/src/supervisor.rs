@@ -65,12 +65,22 @@ pub fn server_healthy(port: u16) -> bool {
 // "healthy" status, so a degraded report (open circuit breaker) or a reply
 // slower than its timeout while the event loop grinds through /api/usage
 // calls would be misread as "server down".
-pub fn server_responding(port: u16) -> bool {
+//
+// `None` when nothing answers on the port, otherwise what the server reported
+// about itself — empty for a non-2xx reply, which still counts as responding.
+// The version feeds `omniauth`'s choice of CLI-token salt.
+pub fn probe_health(port: u16) -> Option<RunningServer> {
     let url = format!("http://127.0.0.1:{port}/api/monitoring/health");
     match ureq::get(&url).timeout(Duration::from_secs(2)).call() {
-        Ok(_) => true,
-        Err(ureq::Error::Status(_, _)) => true,
-        Err(_) => false,
+        Ok(resp) => Some(
+            resp.into_string()
+                .ok()
+                .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+                .map(|v| parse_running_server(&v))
+                .unwrap_or_default(),
+        ),
+        Err(ureq::Error::Status(_, _)) => Some(RunningServer::default()),
+        Err(_) => None,
     }
 }
 

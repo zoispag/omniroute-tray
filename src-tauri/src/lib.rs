@@ -40,9 +40,14 @@ struct AppState {
     server: Mutex<ServerState>,
     data: Mutex<Option<DataClient>>,
     active_version: Mutex<Option<String>>,
+    /// The version the server on the port *reports* (`/api/monitoring/health`),
+    /// which differs from `active_version` for an adopted server the user runs
+    /// themselves. Refreshed by `monitor_health`; only `omniauth` needs it.
+    served_version: Mutex<Option<String>>,
     /// Bearer key + loopback CLI token presented on every management call.
-    /// Resolved at bootstrap; re-resolved lazily while the key is still missing
-    /// (a fresh install mints its first key only after the server starts).
+    /// Resolved at bootstrap; the key is re-resolved lazily while it is still
+    /// missing (a fresh install mints its first key only after the server
+    /// starts), the token on every request (see `credentials_for_request`).
     auth: Mutex<Credentials>,
     supervisor: Mutex<Option<supervisor::Supervisor>>,
     pin_open: std::sync::atomic::AtomicBool,
@@ -81,6 +86,7 @@ impl AppState {
             server: Mutex::new(ServerState::Stopped),
             data: Mutex::new(None),
             active_version: Mutex::new(None),
+            served_version: Mutex::new(None),
             auth: Mutex::new(Credentials::default()),
             supervisor: Mutex::new(None),
             pin_open: std::sync::atomic::AtomicBool::new(false),
@@ -240,6 +246,8 @@ fn bootstrap(app: tauri::AppHandle) {
                 Reconciliation::Adopt | Reconciliation::ReconcileForeign => true,
             };
             if ready {
+                *app.state::<AppState>().served_version.lock().unwrap() =
+                    supervisor::running_server(20128).and_then(|s| s.version);
                 set_state(
                     &app,
                     ServerState::Running {
@@ -277,8 +285,12 @@ fn monitor_health(app: tauri::AppHandle) {
         let mut consecutive_failures: u32 = 0;
         loop {
             std::thread::sleep(std::time::Duration::from_secs(5));
-            let responding = supervisor::server_responding(20128);
+            let probe = supervisor::probe_health(20128);
+            let responding = probe.is_some();
             let app_state = app.state::<AppState>();
+            if let Some(served) = probe.and_then(|p| p.version) {
+                *app_state.served_version.lock().unwrap() = Some(served);
+            }
             let current = app_state.server.lock().unwrap().clone();
             let version = app_state.active_version.lock().unwrap().clone();
             // Misses only count while the server is meant to be up. Starting,
@@ -408,34 +420,53 @@ fn schedule_quota_refresh(app: tauri::AppHandle) {
 
 /// Everything the tray can present to the local server: the shared API key from
 /// `.env`/`storage.sqlite` plus the machine-derived loopback CLI token (#42).
-/// The token depends only on the machine, so a `known_token` is reused instead
-/// of shelling out to `ioreg` again.
-fn resolve_credentials(paths: &AppPaths, known_token: Option<String>) -> Credentials {
-    let env_path = paths.omniroute_env_path();
-    let db_path = paths.omniroute_db_path();
+fn resolve_credentials(paths: &AppPaths, server_version: Option<&str>) -> Credentials {
     Credentials {
-        api_key: apikey::resolve(&env_path, &db_path),
-        cli_token: known_token.or_else(|| omniauth::resolve_cli_token(&env_path)),
+        api_key: apikey::resolve(&paths.omniroute_env_path(), &paths.omniroute_db_path()),
+        cli_token: resolve_cli_token(paths, server_version),
     }
 }
 
-/// Credentials for one data request. Blocking (touches disk when re-resolving),
-/// so call it from `spawn_blocking`. While no API key is known yet, look again
-/// each time: on a fresh install the server creates `storage.sqlite` and its
-/// default key *after* bootstrap already resolved, and without this the popover
-/// would show the usage skeleton until the next tray restart.
+fn resolve_cli_token(paths: &AppPaths, server_version: Option<&str>) -> Option<String> {
+    omniauth::resolve_cli_token(
+        &paths.omniroute_env_path(),
+        &paths.omniroute_cli_salt_path(),
+        server_version,
+    )
+}
+
+/// Credentials for one data request. Blocking (touches disk), so call it from
+/// `spawn_blocking`.
+///
+/// The CLI token is re-derived every time: OmniRoute 3.8.51+ salts it with a
+/// per-install value it writes on first use (#76), which on a fresh install is
+/// *after* bootstrap derived ours, and a token cached from then on would be
+/// rejected for the rest of the tray's life. While no API key is known yet,
+/// that is looked up again too: the server creates `storage.sqlite` and its
+/// default key after bootstrap as well, and without this the popover would show
+/// the usage skeleton until the next tray restart.
 fn credentials_for_request(app: &tauri::AppHandle) -> Credentials {
     let state = app.state::<AppState>();
     let cached = state.auth.lock().unwrap().clone();
-    if cached.api_key.is_some() {
-        return cached;
-    }
     let Ok(paths) = AppPaths::resolve(app) else {
         return cached;
     };
-    let fresh = resolve_credentials(&paths, cached.cli_token.clone());
-    if fresh.api_key.is_some() {
-        log::info!("OmniRoute API key became available; using it from now on");
+    let version = state.served_version.lock().unwrap().clone();
+    let fresh = if cached.api_key.is_some() {
+        Credentials {
+            cli_token: resolve_cli_token(&paths, version.as_deref()),
+            ..cached.clone()
+        }
+    } else {
+        resolve_credentials(&paths, version.as_deref())
+    };
+    if fresh != cached {
+        if fresh.api_key.is_some() && cached.api_key.is_none() {
+            log::info!("OmniRoute API key became available; using it from now on");
+        }
+        if fresh.cli_token != cached.cli_token {
+            log::info!("OmniRoute CLI token changed (salt source); using the new one");
+        }
         *state.auth.lock().unwrap() = fresh.clone();
     }
     fresh
