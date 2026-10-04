@@ -211,7 +211,7 @@ fn bootstrap(app: tauri::AppHandle) {
         *app_state.data.lock().unwrap() =
             Some(DataClient::new(paths.node_bin.clone(), entry.clone()));
         *app_state.active_version.lock().unwrap() = Some(version.clone());
-        let creds = resolve_credentials(&paths);
+        let creds = resolve_credentials(&paths, None);
         if creds.cli_token.is_none() {
             log::warn!("could not derive the OmniRoute CLI token; management calls will rely on the API key alone");
         }
@@ -409,18 +409,28 @@ fn schedule_quota_refresh(app: tauri::AppHandle) {
 
 /// Everything the tray can present to the local server: the shared API key from
 /// `.env`/`storage.sqlite` plus the machine-derived loopback CLI token (#42).
-fn resolve_credentials(paths: &AppPaths) -> Credentials {
+fn resolve_credentials(paths: &AppPaths, server_version: Option<&str>) -> Credentials {
     Credentials {
         api_key: apikey::resolve(&paths.omniroute_env_path(), &paths.omniroute_db_path()),
-        cli_token: resolve_cli_token(paths),
+        cli_token: resolve_cli_token(paths, server_version),
     }
 }
 
-fn resolve_cli_token(paths: &AppPaths) -> Option<String> {
+fn resolve_cli_token(paths: &AppPaths, server_version: Option<&str>) -> Option<String> {
     omniauth::resolve_cli_token(
         &paths.omniroute_env_path(),
         &paths.omniroute_cli_salt_path(),
+        server_version,
     )
+}
+
+/// The version the live server reports on `/api/monitoring/health`, if known.
+fn live_server_version(state: &AppState) -> Option<String> {
+    match &*state.server.lock().unwrap() {
+        ServerState::Running { version } => version.clone(),
+        ServerState::UpdateAvailable { current, .. } => Some(current.clone()),
+        _ => None,
+    }
 }
 
 /// Credentials for one data request. Blocking (touches disk), so call it from
@@ -439,20 +449,21 @@ fn credentials_for_request(app: &tauri::AppHandle) -> Credentials {
     let Ok(paths) = AppPaths::resolve(app) else {
         return cached;
     };
+    let version = live_server_version(&state);
     let fresh = if cached.api_key.is_some() {
         Credentials {
-            cli_token: resolve_cli_token(&paths),
+            cli_token: resolve_cli_token(&paths, version.as_deref()),
             ..cached.clone()
         }
     } else {
-        resolve_credentials(&paths)
+        resolve_credentials(&paths, version.as_deref())
     };
     if fresh != cached {
         if fresh.api_key.is_some() && cached.api_key.is_none() {
             log::info!("OmniRoute API key became available; using it from now on");
         }
         if fresh.cli_token != cached.cli_token {
-            log::info!("OmniRoute CLI token changed (per-install salt); using the new one");
+            log::info!("OmniRoute CLI token changed (salt source); using the new one");
         }
         *state.auth.lock().unwrap() = fresh.clone();
     }

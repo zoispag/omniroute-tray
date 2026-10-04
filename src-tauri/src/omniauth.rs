@@ -26,7 +26,10 @@
 //! `<DATA_DIR>/cli-token-salt.json` the first time it checks a token (#76). The
 //! literal is only the fallback for when that file is absent, i.e. older servers
 //! — which is also why the tray never creates the file itself: a server that
-//! predates it would keep using the literal and reject the tray.
+//! predates it would keep using the literal and reject the tray. For the same
+//! reason a salt file is ignored while the live server reports an older version:
+//! `~/.omniroute` is shared, so the file may have been left by a newer
+//! `omniroute` the user ran by hand.
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -36,6 +39,8 @@ use sha2::{Digest, Sha256};
 
 pub const CLI_TOKEN_HEADER: &str = "x-omniroute-cli-token";
 const DEFAULT_SALT: &str = "omniroute-cli-auth-v1";
+/// First OmniRoute release that salts the token per install (#13679).
+const PERSISTED_SALT_SINCE: semver::Version = semver::Version::new(3, 8, 51);
 
 /// What gets attached to every request against the local server.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -68,20 +73,38 @@ impl Credentials {
 /// Resolve the CLI token for this machine the way `bin/cli/utils/cliToken.mjs`
 /// does: `OMNIROUTE_CLI_TOKEN` wins, then the salt from `OMNIROUTE_CLI_SALT`,
 /// the per-install salt file, or the built-in literal, in that order.
+/// `server_version` is what the live server reports; the salt file is skipped
+/// for one older than 3.8.51, which never reads it. Unknown → the file counts.
 ///
 /// Cheap enough to call per request (the machine id is read once per process),
 /// and it has to be: on a fresh install the server writes the salt file only
 /// after the tray's first request, so a token derived once at startup would be
 /// stale for the rest of the tray's life.
-pub fn resolve_cli_token(env_path: &Path, salt_path: &Path) -> Option<String> {
+pub fn resolve_cli_token(
+    env_path: &Path,
+    salt_path: &Path,
+    server_version: Option<&str>,
+) -> Option<String> {
     let env = std::fs::read_to_string(env_path).unwrap_or_default();
     if let Some(explicit) = env_value(&env, "OMNIROUTE_CLI_TOKEN") {
         return Some(explicit);
     }
     let salt = env_value(&env, "OMNIROUTE_CLI_SALT")
-        .or_else(|| read_persisted_salt(salt_path))
+        .or_else(|| {
+            reads_salt_file(server_version)
+                .then(|| read_persisted_salt(salt_path))
+                .flatten()
+        })
         .unwrap_or_else(|| DEFAULT_SALT.to_string());
-    Some(derive_machine_token(machine_id()?, &salt))
+    Some(derive_machine_token(&machine_id()?, &salt))
+}
+
+/// Whether a server reporting `version` derives its token from the salt file.
+/// An unknown or unparsable version counts as new: current releases are.
+fn reads_salt_file(version: Option<&str>) -> bool {
+    version
+        .and_then(|v| semver::Version::parse(v.trim().trim_start_matches('v')).ok())
+        .is_none_or(|v| v >= PERSISTED_SALT_SINCE)
 }
 
 /// The salt OmniRoute persisted for this install (`{"salt": "<64 hex>"}`), or
@@ -95,11 +118,16 @@ fn read_persisted_salt(path: &Path) -> Option<String> {
     valid.then(|| salt.to_string())
 }
 
-/// The raw machine id, read once: it cannot change while the tray runs, and on
-/// macOS reading it means spawning `ioreg`.
-fn machine_id() -> Option<&'static str> {
-    static ID: OnceLock<Option<String>> = OnceLock::new();
-    ID.get_or_init(raw_machine_id).as_deref()
+/// The raw machine id, read once it has been read successfully: it cannot
+/// change while the tray runs, and on macOS reading it means spawning `ioreg`.
+/// A failed read is not cached, so the next request tries again.
+fn machine_id() -> Option<String> {
+    static ID: OnceLock<String> = OnceLock::new();
+    if let Some(id) = ID.get() {
+        return Some(id.clone());
+    }
+    let id = raw_machine_id()?;
+    Some(ID.get_or_init(|| id).clone())
 }
 
 /// `HMAC-SHA256(key = raw_id, msg = salt)` → lowercase hex. Same as
@@ -300,7 +328,10 @@ mod tests {
         std::fs::write(&env, "OMNIROUTE_CLI_TOKEN=deadbeef\n").unwrap();
         let salt = tmp.path().join("cli-token-salt.json");
         std::fs::write(&salt, format!(r#"{{"salt":"{}"}}"#, "a".repeat(64))).unwrap();
-        assert_eq!(resolve_cli_token(&env, &salt).as_deref(), Some("deadbeef"));
+        assert_eq!(
+            resolve_cli_token(&env, &salt, None).as_deref(),
+            Some("deadbeef")
+        );
     }
 
     #[test]
@@ -329,29 +360,49 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn salt_precedence_matches_cli_token_mjs() {
-        let id = machine_id().expect("ioreg available on macOS");
+        let id = &machine_id().expect("ioreg available on macOS");
         let tmp = tempfile::tempdir().unwrap();
         let env = tmp.path().join(".env");
         let salt_file = tmp.path().join("cli-token-salt.json");
         let persisted = "f".repeat(64);
 
         assert_eq!(
-            resolve_cli_token(&env, &salt_file),
+            resolve_cli_token(&env, &salt_file, None),
             Some(derive_machine_token(id, DEFAULT_SALT)),
             "no salt file: the literal, as older servers expect"
         );
 
         std::fs::write(&salt_file, format!(r#"{{"salt":"{persisted}"}}"#)).unwrap();
         assert_eq!(
-            resolve_cli_token(&env, &salt_file),
+            resolve_cli_token(&env, &salt_file, None),
+            Some(derive_machine_token(id, &persisted))
+        );
+
+        assert_eq!(
+            resolve_cli_token(&env, &salt_file, Some("3.8.50")),
+            Some(derive_machine_token(id, DEFAULT_SALT)),
+            "a pre-3.8.51 server ignores a salt file left by a newer omniroute"
+        );
+        assert_eq!(
+            resolve_cli_token(&env, &salt_file, Some("3.8.51")),
             Some(derive_machine_token(id, &persisted))
         );
 
         std::fs::write(&env, "OMNIROUTE_CLI_SALT=rotated\n").unwrap();
         assert_eq!(
-            resolve_cli_token(&env, &salt_file),
+            resolve_cli_token(&env, &salt_file, None),
             Some(derive_machine_token(id, "rotated"))
         );
+    }
+
+    #[test]
+    fn salt_file_is_read_from_3_8_51_on() {
+        assert!(!reads_salt_file(Some("3.8.44")));
+        assert!(!reads_salt_file(Some("3.8.50")));
+        assert!(reads_salt_file(Some("3.8.51")));
+        assert!(reads_salt_file(Some("v3.9.0")));
+        assert!(reads_salt_file(None), "unknown: current servers read it");
+        assert!(reads_salt_file(Some("garbage")));
     }
 
     #[test]
