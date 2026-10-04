@@ -1,6 +1,6 @@
 [package]
 name = "omniroute-tray"
-version = "0.1.21"
+version = "0.1.22"
 description = "A cross-platform tray app that supervises, monitors, and auto-updates the OmniRoute AI router."
 authors = ["OmniRouteTray contributors"]
 license = "MIT"
@@ -13,10 +13,10 @@ name = "omniroute_tray_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2.6.3", features = [] }
+tauri-build = { version = "2.7.1", features = [] }
 
 [dependencies]
-tauri = { version = "2.11.3", features = ["tray-icon", "macos-private-api", "image-png"] }
+tauri = { version = "2.12.1", features = ["tray-icon", "macos-private-api", "image-png"] }
 tauri-plugin-log = "2"
 tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
 tauri-plugin-single-instance = "2"
@@ -35,24 +35,13 @@ hmac = "0.13"
 sha2 = "0.11"
 hex = "0.4"
 
-# macOS 27 tray-click workaround (see src/traymenu.rs). Already in the tree via
-# tao/muda/tray-icon; declared here for the status item highlight and the OS check.
+# Popover space-following (see src/spaces.rs). Already in the tree via tao.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = [
   "std",
-  "NSApplication",
-  "NSButton",
-  "NSControl",
   "NSResponder",
-  "NSStatusBarButton",
-  "NSView",
   "NSWindow",
-] }
-objc2-foundation = { version = "0.3", default-features = false, features = [
-  "std",
-  "NSArray",
-  "NSProcessInfo",
 ] }
 
 [dev-dependencies]

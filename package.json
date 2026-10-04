@@ -1,6 +1,6 @@
 {
   "name": "omniroute-tray",
-  "version": "0.1.21",
+  "version": "0.1.22",
   "description": "A cross-platform tray app that supervises, monitors, and auto-updates the OmniRoute AI router.",
   "license": "MIT",
   "type": "module",
@@ -16,6 +16,6 @@
     "vite": "^8.3.1"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.0.0"
+    "@tauri-apps/api": "^2.12.1"
   }
 }

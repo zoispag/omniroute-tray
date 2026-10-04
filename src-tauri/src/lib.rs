@@ -17,7 +17,6 @@ mod runtime;
 mod spaces;
 mod state;
 mod supervisor;
-mod traymenu;
 mod updater;
 
 use std::sync::Mutex;
@@ -529,20 +528,6 @@ fn toggle_popover(app: &tauri::AppHandle) {
     }
 }
 
-/// Show the tray menu ourselves, for the macOS versions where the status item
-/// cannot own it (see `traymenu`). The popover is only borrowed as the menu's
-/// owner window — it stays hidden, and the menu opens at the pointer.
-fn show_tray_menu(app: &tauri::AppHandle, menu: &tauri::menu::Menu<tauri::Wry>) {
-    let window = app
-        .get_webview_window(POPOVER_LABEL)
-        .or_else(|| recreate_popover(app));
-    let Some(window) = window else {
-        log::warn!("no window to anchor the tray menu to");
-        return;
-    };
-    traymenu::present(window.as_ref().window(), menu);
-}
-
 #[tauri::command]
 fn get_status(state: tauri::State<AppState>) -> ServerState {
     state.server.lock().unwrap().clone()
@@ -895,91 +880,66 @@ pub fn run() {
                 .items(&[&quit])
                 .build()?;
 
-            // On macOS 27 a status item that owns an NSMenu never forwards clicks
-            // to its view, so the menu has to stay off it and we present it
-            // ourselves on right-click (see `traymenu`).
-            let detached_menu = traymenu::detached();
-            log::info!(
-                "tray menu presented by {}",
-                if detached_menu {
-                    "the app"
-                } else {
-                    "the status item"
-                }
-            );
-
-            let mut tray = TrayIconBuilder::with_id("main")
+            TrayIconBuilder::with_id("main")
                 .icon(tray_icon)
-                .icon_as_template(true);
-            if !detached_menu {
-                tray = tray.menu(&menu).show_menu_on_left_click(false);
-            }
-
-            tray.on_tray_icon_event(move |tray, event| {
-                tauri_plugin_positioner::on_tray_event(tray.app_handle(), &event);
-                let TrayIconEvent::Click {
-                    button,
-                    button_state,
-                    ..
-                } = event
-                else {
-                    return;
-                };
-                match (button, button_state) {
-                    (MouseButton::Left, MouseButtonState::Up) => {
+                .icon_as_template(true)
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_tray_icon_event(|tray, event| {
+                    tauri_plugin_positioner::on_tray_event(tray.app_handle(), &event);
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
                         toggle_popover(tray.app_handle());
                     }
-                    // Only ours to handle while the status item has no menu of
-                    // its own; otherwise AppKit is already showing one.
-                    (MouseButton::Right, MouseButtonState::Down) if detached_menu => {
-                        show_tray_menu(tray.app_handle(), &menu);
+                })
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "quit" => {
+                        // Cleanup runs in the RunEvent::ExitRequested handler, off the
+                        // live popover, so Quit no longer blocks the UI here.
+                        app.exit(0);
+                    }
+                    "dashboard" => {
+                        let _ =
+                            tauri_plugin_opener::open_url("http://127.0.0.1:20128", None::<&str>);
+                    }
+                    "restart" => {
+                        let handle = app.clone();
+                        std::thread::spawn(move || restart_flow(handle));
+                    }
+                    "doctor" => {
+                        // Same recovery as `toggle_popover`: the popover may be
+                        // missing, now that it is built at runtime rather than by
+                        // the config, and Doctor with no window would do nothing.
+                        if let Some(window) = app
+                            .get_webview_window(POPOVER_LABEL)
+                            .or_else(|| recreate_popover(app))
+                        {
+                            app.state::<AppState>()
+                                .pin_open
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            let _ = window.move_window_constrained(Position::TrayCenter);
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                            let _ = window.emit("run-doctor", ());
+                        }
+                    }
+                    "logs" => {
+                        if let Ok(paths) = AppPaths::resolve(app) {
+                            let log = logfile::ServerLog::new(&paths.log_dir);
+                            let _ = log.ensure_exists();
+                            let _ = tauri_plugin_opener::open_path(
+                                log.path().display().to_string(),
+                                None::<&str>,
+                            );
+                        }
                     }
                     _ => {}
-                }
-            })
-            .on_menu_event(|app, event| match event.id().as_ref() {
-                "quit" => {
-                    // Cleanup runs in the RunEvent::ExitRequested handler, off the
-                    // live popover, so Quit no longer blocks the UI here.
-                    app.exit(0);
-                }
-                "dashboard" => {
-                    let _ = tauri_plugin_opener::open_url("http://127.0.0.1:20128", None::<&str>);
-                }
-                "restart" => {
-                    let handle = app.clone();
-                    std::thread::spawn(move || restart_flow(handle));
-                }
-                "doctor" => {
-                    // Same recovery as `toggle_popover`: the popover may be
-                    // missing, now that it is built at runtime rather than by
-                    // the config, and Doctor with no window would do nothing.
-                    if let Some(window) = app
-                        .get_webview_window(POPOVER_LABEL)
-                        .or_else(|| recreate_popover(app))
-                    {
-                        app.state::<AppState>()
-                            .pin_open
-                            .store(true, std::sync::atomic::Ordering::SeqCst);
-                        let _ = window.move_window_constrained(Position::TrayCenter);
-                        let _ = window.show();
-                        let _ = window.set_focus();
-                        let _ = window.emit("run-doctor", ());
-                    }
-                }
-                "logs" => {
-                    if let Ok(paths) = AppPaths::resolve(app) {
-                        let log = logfile::ServerLog::new(&paths.log_dir);
-                        let _ = log.ensure_exists();
-                        let _ = tauri_plugin_opener::open_path(
-                            log.path().display().to_string(),
-                            None::<&str>,
-                        );
-                    }
-                }
-                _ => {}
-            })
-            .build(app)?;
+                })
+                .build(app)?;
 
             let handle = app.handle().clone();
             std::thread::spawn(move || bootstrap(handle));
